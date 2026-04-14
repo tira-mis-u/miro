@@ -1,7 +1,8 @@
 import { getStroke } from 'perfect-freehand';
 import * as Y from 'yjs';
 import RBush from 'rbush';
-import katex from 'katex';
+import { parseTelex } from '../formula/parser';
+import { renderFormulaStatic } from '../formula/renderer';
 import * as Prism from 'prismjs';
 import 'prismjs/components/prism-javascript';
 import 'prismjs/components/prism-typescript';
@@ -99,7 +100,10 @@ export class CanvasEngine {
   public onSel?:      (ids:string[]) => void;
   public onZoom?:     (z:number) => void;
   public onCam?:      (cam:Camera) => void;
-  public onEditText?: (s:StickyShape|TextShape) => void;
+  public onCameraChange: ((cam: Camera) => void) | null = null;
+  public onContextMenu?: (x:number, y:number) => void;
+  public onTextEdit?: (s:AnyShape) => void;
+  public onEditText?: (s: StickyShape | TextShape, cx: number, cy: number) => void;
   public onCursor?:   (cursor:string) => void;
   public onTool?:     (tool:ToolType) => void;
 
@@ -175,6 +179,9 @@ export class CanvasEngine {
 
   // ─── pointer events (called with raw DOM events from window listener) ───
   pointerDown(e: PointerEvent) {
+    if (e.button !== 0 && e.button !== 1) return; // Only left or middle (for pan)
+    if (e.target && (e.target as HTMLElement).closest('.formula-editor-panel, .popover, .math-tools-panel, .no-canvas, .zoom-controls, .panel-ui, .toolbar')) return;
+
     const w = this.clientToWorld(e.clientX, e.clientY);
 
     if (this.tool === 'hand' || e.button === 1) {
@@ -284,8 +291,8 @@ export class CanvasEngine {
     if (['sticky', 'text', 'math', 'code'].includes(this.tool)) {
       if (this.tool === 'sticky') {
         const id = uid();
-        const x = w.x;
-        const y = w.y;
+        const x = w.x - 16 / this.cam.zoom;
+        const y = w.y - 16 / this.cam.zoom;
         const s: StickyShape = {
           id, type: 'sticky',
           x, y, w: 240, h: 240, fs: 14,
@@ -295,19 +302,23 @@ export class CanvasEngine {
         this.put(s);
         this.sel.add(id); this.onSel?.([id]);
         this.saveH();
-        setTimeout(() => this.onEditText?.(s), 30);
+        setTimeout(() => this.onEditText?.(s, e.clientX, e.clientY), 30);
       } else {
         const id = uid();
+        const offsetX = (this.tool === 'code' ? 46 : 16) / this.cam.zoom;
+        const offsetY = (this.tool === 'code' ? 12 : 16) / this.cam.zoom;
+        const nx = w.x - offsetX;
+        const ny = w.y - offsetY;
         const s: TextShape = {
-          id, type:this.tool as any, x:w.x, y:w.y, w:200, h:40,
+          id, type:this.tool as any, x:nx, y:ny, w:200, h:40,
           text: '', 
           color: this.tool === 'code' ? '#111' : '#000000', fs:this.style.fontSize,
-          minX:w.x, minY:w.y, maxX:w.x+200, maxY:w.y+40,
+          minX:nx, minY:ny, maxX:nx+200, maxY:ny+40,
         };
         this.put(s);
         this.sel.add(id); this.onSel?.([id]);
         this.saveH();
-        setTimeout(() => this.onEditText?.(s), 30);
+        setTimeout(() => this.onEditText?.(s, e.clientX, e.clientY), 30);
       }
       return;
     }
@@ -523,7 +534,52 @@ export class CanvasEngine {
     const w = this.clientToWorld(e.clientX, e.clientY);
     const hit = this.hitShape(w.x, w.y);
     if (hit && (hit.type==='sticky'||hit.type==='text'||hit.type==='math'||hit.type==='code')) {
-      this.onEditText?.(hit as StickyShape|TextShape);
+      this.onEditText?.(hit as StickyShape|TextShape, e.clientX, e.clientY);
+    }
+  }
+
+  public updateSize(id: string, w: number, h: number) {
+    const s = this.shapes.get(id);
+    if (s && 'w' in s) {
+      const news = { ...s, w, h } as any;
+      news.maxX = news.x + w;
+      news.maxY = news.y + h;
+      this.put(news);
+    }
+  }
+
+  public updatePos(id: string, x: number, y: number) {
+    const s = this.shapes.get(id);
+    if (s && 'x' in s) {
+      // For box shapes (sticky, text, math, code, rect, etc.)
+      const b = s as any;
+      const news = { ...b, x, y };
+      news.minX = x;
+      news.minY = y;
+      news.maxX = x + b.w;
+      news.maxY = y + b.h;
+      this.put(news as AnyShape);
+    } else if (s && s.type === 'pen') {
+      const pen = s as PenShape;
+      const dx = x - pen.minX;
+      const dy = y - pen.minY;
+      const news: PenShape = {
+        ...pen,
+        pts: pen.pts.map(p => [p[0] + dx, p[1] + dy, p[2]]),
+        minX: x, minY: y, maxX: pen.maxX + dx, maxY: pen.maxY + dy
+      };
+      this.put(news);
+    } else if (s && s.type === 'arrow') {
+      const a = s as ArrowShape;
+      const dx = x - a.x1;
+      const dy = y - a.y1;
+      const news: ArrowShape = {
+        ...a,
+        x1: x, y1: y, x2: a.x2 + dx, y2: a.y2 + dy,
+        minX: Math.min(x, a.x2 + dx), minY: Math.min(y, a.y2 + dy),
+        maxX: Math.max(x, a.x2 + dx), maxY: Math.max(y, a.y2 + dy)
+      };
+      this.put(news);
     }
   }
 
@@ -636,6 +692,7 @@ export class CanvasEngine {
     this.cam = {x,y,zoom};
     this.onZoom?.(zoom);
     this.onCam?.(this.cam);
+    this.onCameraChange?.(this.cam);
     this.dirty = true;
   }
 
@@ -695,12 +752,6 @@ export class CanvasEngine {
     }
   }
 
-  updateSize(id: string, w: number, h: number) {
-    const s = this.shapes.get(id);
-    if (s && 'w' in s) {
-      this.put({ ...s, w, h, maxX: (s as any).x + w, maxY: (s as any).y + h } as any);
-    }
-  }
 
   deleteShape(id: string) {
     const s = this.shapes.get(id);
@@ -716,11 +767,21 @@ export class CanvasEngine {
   }
 
   updateStyle(ids: string[], props: Partial<any>) {
-    ids.forEach(id => { const s=this.shapes.get(id); if(s) this.put({...s,...props}); });
+    ids.forEach(id => { 
+      const s = this.shapes.get(id); 
+      if (!s) return;
+      let next = { ...s, ...props };
+      // 🚨 CRITICAL: Update RBush indices if x/y/w/h changed
+      if ('x' in next && 'y' in next) {
+        const b = next as any;
+        next = { ...next, minX: b.x, minY: b.y, maxX: b.x + (b.w||0), maxY: b.y + (b.h||0) };
+      }
+      this.put(next as AnyShape); 
+    });
     this.saveH();
   }
 
-  // image: read natural size from loaded img then place at cursor
+
   addImage(src: string, clientX: number, clientY: number) {
     const img = new Image();
     img.onload = () => {
@@ -805,6 +866,7 @@ export class CanvasEngine {
 
     // Update overlay transforms
     this.wrapperDiv.style.transform = `translate(${cv.width/2}px, ${cv.height/2}px) scale(${cam.zoom}) translate(${-cam.x}px, ${-cam.y}px)`;
+    this.onCameraChange?.(this.cam);
     
     // Rebuild overlays only if necessary
     let overlayHtml = '';
@@ -827,8 +889,11 @@ export class CanvasEngine {
           content = ((s as any).text||'').replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
           overlayHtml += `<div id="ol_${s.id}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; font-size:${((s as any).fs||14)}px; font-family:'Inter',system-ui,sans-serif; color:rgba(15,15,15,0.8); padding:16px; box-sizing:border-box; overflow-y:auto; overflow-x:hidden; white-space:pre-wrap; word-break:break-word; border-radius:3px; background:${(s as any).bg}; box-shadow:0 4px 16px rgba(0,0,0,0.1); pointer-events:auto;"><div style="position:absolute; top:0; right:0; width:14px; height:14px; background:rgba(0,0,0,0.08); clip-path:polygon(100% 0, 0 0, 100% 100%);"></div>${content}</div>`;
         } else if (s.type === 'math') {
-          try { content = katex.renderToString((s as any).text||'E=mc^2', { throwOnError: false }); } catch(e) { content = String(e); }
-          overlayHtml += `<div id="ol_${s.id}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; font-size:${(s.fs||14)}px; color:#000; padding:12px; box-sizing:border-box; overflow:hidden; background:#fff; border-radius:4px; pointer-events:auto;">${content}</div>`;
+          try {
+            const ast = parseTelex((s as any).text || '');
+            content = renderFormulaStatic(ast, (s.fs || 14));
+          } catch(e) { content = String(e); }
+          overlayHtml += `<div id="ol_${s.id}" style="position:absolute; left:${s.x}px; top:${s.y}px; width:${s.w}px; height:${s.h}px; font-size:${(s.fs||14)}px; color:#000; padding:16px; box-sizing:border-box; overflow:hidden; background:transparent; border-radius:4px; pointer-events:auto;">${content}</div>`;
         } else if (s.type === 'code') {
           const lang = Prism.languages.javascript;
           try { content = Prism.highlight((s as any).text||' ', lang, 'javascript'); } catch(e) { content = (s as any).text; }
@@ -842,9 +907,9 @@ export class CanvasEngine {
         if (this.sel.has(s.id)) {
           const z = this.cam.zoom;
           const p = 4; // Padding (world pixels)
-          const hs = 5 / z; // Handle size (screen-corrected world pixels)
-          const sw = 2.5 / z; // Stroke width (screen-corrected world pixels)
-          const hbw = 1.5 / z; // Handle border width
+          const hs = 4 / z; // Handle size (screen-corrected world pixels)
+          const sw = 1.5 / z; // Stroke width (screen-corrected world pixels)
+          const hbw = 1 / z; // Handle border width
 
           overlayHtml += `
             <div style="position:absolute; left:${s.x - p}px; top:${s.y - p}px; width:${s.w + p*2}px; height:${s.h + p*2}px; border:${sw}px solid #3b82f6; border-radius:${3/z}px; pointer-events:none; box-sizing:border-box;"></div>

@@ -1,0 +1,496 @@
+/* ─── Formula Layout Engine v2 (Box-Model) ─── */
+/* Thiết kế theo chuẩn Microsoft Word math rendering */
+
+/* ━━━ Root & Reset ━━━ */
+.fm {
+  display: inline-flex;
+  align-items: baseline;
+  white-space: nowrap;
+  user-select: none;
+  -webkit-font-smoothing: antialiased;
+  font-family: 'Cambria Math', 'Times New Roman', 'STIX Two Math', 'Latin Modern Math', serif;
+}
+
+.fm * {
+  box-sizing: border-box;
+  line-height: inherit;
+}
+
+/* ━━━ Atomic nodes ━━━ */
+.fm-sym, .fm-num, .fm-txt {
+  display: inline-block;
+}
+
+.fm-op {
+  display: inline-block;
+}
+
+/* ━━━ Placeholder ━━━ */
+.fm-ph {
+  display: inline-block;
+  min-width: 0.6em;
+  min-height: 0.8em;
+  border: 1px dashed #a0aec0;
+  background: rgba(226, 232, 240, 0.4);
+  border-radius: 2px;
+  vertical-align: middle;
+  cursor: text;
+  transition: all 0.15s ease;
+  margin: 0 0.1em;
+}
+
+.fm-ph:empty::after {
+  content: '\200B'; /* Zero width space to maintain height */
+}
+
+.f-ph.active {
+  border-color: #3b82f6;
+  background: rgba(59, 130, 246, 0.12);
+  box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.15);
+}
+
+.fm-ph.fm-ph-ghost {
+  border: none;
+  background: transparent;
+  min-width: 0.1em;
+  margin: 0;
+}
+
+.fm-ph:hover {
+  border-color: #3b82f6;
+  background: rgba(59, 130, 246, 0.1);
+}
+
+/* ━━━ Container ━━━ */
+.fm-row {
+  display: inline-flex;
+  align-items: baseline;
+}
+
+/* ━━━ Fraction ━━━ */
+.fm-frac {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  vertical-align: middle;
+  margin: 0 0.2em;
+}
+
+.fm-frac-n, .fm-frac-d {
+  display: inline-flex;
+  justify-content: center;
+  align-items: center;
+  padding: 0.1em 0.2em;
+}
+
+.fm-frac-bar {
+  width: 100%;
+  height: 0.05em; /* Scale bar thickness with font size */
+  background-color: currentColor;
+  min-width: 1em;
+  flex-shrink: 0;
+}
+
+/* ━━━ Root ━━━ */
+.fm-root {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+  margin: 0 0.1em;
+}
+
+.fm-root-deg {
+  margin-right: -0.2em;
+  transform: translateY(-0.8em);
+  position: relative;
+  z-index: 1;
+}
+
+.fm-root-surd {
+  font-size: 1.2em;
+  transform: translateY(0.05em);
+  margin-right: -0.05em;
+}
+
+.fm-root-body {
+  border-top: 0.05em solid currentColor;
+  padding-top: 0.1em;
+  padding-left: 0.1em;
+  padding-right: 0.1em;
+  display: inline-flex;
+  align-items: baseline;
+  height: 100%; /* Stretch to content height */
+}
+
+/* ━━━ Scripts (Superscript, Subscript) ━━━ */
+.fm-script {
+  display: inline-flex;
+  align-items: baseline;
+}
+
+.fm-base {
+  display: inline-block;
+}
+
+.fm-sup {
+  transform: translateY(-0.6em);
+  margin-left: 0.05em;
+}
+
+.fm-sub {
+  transform: translateY(0.3em);
+  margin-left: 0.05em;
+}
+
+.fm-supsub-col {
+  display: inline-flex;
+  flex-direction: column;
+  justify-content: center;
+  margin-left: 0.05em;
+  align-self: center; /* Center the column relative to the base */
+}
+
+.fm-supsub-col .fm-sup {
+  transform: translateY(0);
+  margin-bottom: 0.1em;
+}
+
+.fm-supsub-col .fm-sub {
+  transform: translateY(0);
+}
+
+/* ━━━ Big Operators (Integral, Sum, Product) ━━━ */
+/* Layout: upper top, lower bottom, symbol center. Whole block aligned middle with body */
+.fm-bigop {
+  display: inline-flex;
+  align-items: center; /* Center everything vertically */
+  vertical-align: middle;
+  margin: 0 0.2em;
+}
+
+.fm-bigop-core {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  margin-right: -0.1em; /* Tighter integration with body */
+}
+
+.fm-bigop-sym {
+  line-height: 0.65; /* Even tighter for large symbols */
+  font-weight: 800; /* Extra bold */
+  text-shadow: 0.3px 0 0 currentcolor; /* Faux-bold for thickness if font doesn't support 800 */
+  font-family: 'Cambria Math', 'STIX Two Math', serif !important;
+  min-width: 0.8em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.fm-bigop-upper {
+  margin-bottom: 0.1em;
+}
+
+.fm-bigop-lower {
+  margin-top: 0.1em;
+}
+
+.fm-bigop-body {
+  display: inline-flex;
+  align-items: baseline;
+}
+
+/* ━━━ Limit ━━━ */
+.fm-lim {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+  margin: 0 0.2em;
+}
+
+.fm-lim-core {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  margin-right: 0.4em;
+}
+
+.fm-lim-op {
+  font-style: normal;
+  font-weight: normal;
+}
+
+.fm-lim-lower {
+  margin-top: 0.1em;
+}
+
+.fm-lim-body {
+  display: inline-flex;
+  align-items: baseline;
+}
+
+/* ━━━ Delimiters (Parens, Brackets, Braces) ━━━ */
+.fm-delim {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+}
+
+.fm-delim-l, .fm-delim-r {
+  font-weight: normal;
+  font-style: normal;
+  color: #333;
+  /* Basic stretch simulation, true stretching requires SVG or more complex logic */
+  display: flex;
+  align-items: center;
+}
+
+.fm-delim-inner {
+  display: inline-flex;
+  align-items: baseline;
+  padding: 0 0.1em;
+}
+
+/* ━━━ Matrix ━━━ */
+.fm-matrix {
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle;
+  margin: 0 0.2em;
+}
+
+.fm-matrix-grid {
+  display: inline-grid;
+  gap: 0.2em 0.5em; /* Row gap 0.2em, Col gap 0.5em */
+  align-items: center;
+  justify-items: center;
+  padding: 0 0.2em;
+}
+
+.fm-matrix-cell {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  min-width: 1em;
+  min-height: 1.2em;
+}
+
+/* ─── Formula Editor Panel UI (Giữ nguyên) ─── */
+.formula-editor-panel {
+  position: absolute;
+  z-index: 800; /* High, but lower than main UI */
+  background: rgba(255, 255, 255, 0.96);
+  backdrop-filter: blur(8px);
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.1), 0 0 0 1px rgba(0, 0, 0, 0.05);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border: 2px solid #2563eb; /* Deeper blue, thicker */
+}
+
+.formula-preview {
+  padding: 16px;
+  min-height: 80px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(250, 251, 255, 0.5);
+  border-bottom: 2px solid #3b82f620;
+  overflow: auto;
+  font-size: 1.4em !important; /* Increase preview size */
+}
+.formula-preview:empty::before {
+  content: 'Your formula preview...';
+  color: #aab;
+  font-size: 13px;
+  font-style: italic;
+}
+
+.formula-input-wrapper {
+  position: relative;
+  display: flex;
+  background: #fff;
+}
+
+.formula-input-gutter {
+  width: 40px;
+  background: rgba(240, 242, 245, 0.4);
+  border-right: 1px solid rgba(0, 0, 0, 0.05);
+  display: flex;
+  flex-direction: column;
+  padding: 16px 0;
+  user-select: none;
+  pointer-events: none;
+}
+
+.gutter-line {
+  height: 25.6px; /* 1.6 * 16px line-height */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px;
+  color: #94a3b8;
+  opacity: 0.7;
+}
+
+.formula-input {
+  width: 100%;
+  border: none !important;
+  outline: none !important;
+  padding: 16px 20px 16px 12px; /* Reduced left padding because gutter is separate */
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 16px;
+  color: #333;
+  background: transparent !important;
+  resize: none;
+  line-height: 1.6;
+}
+.formula-input::placeholder {
+  color: #b0b8c4;
+  font-style: italic;
+}
+.formula-input:focus {
+  background: #fafbff;
+}
+
+.math-tools-panel {
+  position: fixed;
+  z-index: 900; /* Below sidebar/header, above editor */
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0, 0, 0, 0.04);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  border: 2px solid #2563eb; /* Deeper blue, thicker */
+  transition: box-shadow 0.2s ease;
+}
+
+.math-tools-header {
+  padding: 12px 16px;
+  border-bottom: 1px solid #f0f0f4;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: linear-gradient(135deg, #fafbff 0%, #f8f9fc 100%);
+  cursor: move; /* Draggable indicator */
+}
+.math-tools-header .icon {
+  color: #64748b;
+}
+.math-tools-header .title {
+  font-size: 13px;
+  font-weight: 600;
+  color: #334155;
+}
+
+.math-tools-body {
+  padding: 12px;
+  overflow-y: auto;
+  max-height: 60vh;
+}
+
+.math-tools-section {
+  margin-bottom: 14px;
+}
+.math-tools-section:last-child {
+  margin-bottom: 0;
+}
+
+.math-tools-section-title {
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #94a3b8;
+  margin-bottom: 6px;
+  padding-left: 2px;
+}
+
+.math-tools-grid {
+  display: grid;
+  grid-template-columns: repeat(5, 1fr);
+  gap: 4px;
+}
+.math-tools-grid.structures {
+  grid-template-columns: repeat(4, 1fr);
+}
+
+.math-tool-btn {
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid #e8eaf0;
+  border-radius: 8px;
+  background: #fff;
+  color: #334155;
+  font-size: 16px;
+  cursor: pointer;
+  transition: all 0.12s ease;
+  font-family: 'Times New Roman', serif;
+  user-select: none;
+}
+.math-tool-btn:hover {
+  background: #eff6ff;
+  border-color: #bfdbfe;
+  color: #2563eb;
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(37, 99, 235, 0.1);
+}
+.math-tool-btn:active {
+  transform: translateY(0);
+  box-shadow: none;
+}
+
+.math-tool-btn.structure {
+  font-size: 12px;
+  font-family: 'Inter', sans-serif;
+  font-weight: 500;
+  padding: 4px 6px;
+  color: #475569;
+  flex-direction: column;
+  gap: 2px;
+  height: auto;
+  min-height: 44px;
+}
+.math-tool-btn.structure .struct-icon {
+  font-size: 16px;
+  font-family: 'Times New Roman', serif;
+  line-height: 1;
+}
+.math-tool-btn.structure .struct-label {
+  font-size: 9px;
+  color: #94a3b8;
+}
+
+.math-tools-footer {
+  padding: 10px 14px;
+  background: #f8fafc;
+  border-top: 1px solid #f0f0f4;
+  font-size: 11px;
+  color: #94a3b8;
+}
+.math-tools-footer code {
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 10px;
+  font-family: 'JetBrains Mono', monospace;
+  color: #6366f1;
+}
+
+@keyframes formula-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.formula-editor-panel,
+.math-tools-panel {
+  animation: formula-fade-in 0.18s ease-out;
+}
