@@ -1,8 +1,8 @@
 import * as React from 'react';
-import { useEffect, useRef, useState, useCallback } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
 import {
-  MousePointer2, Hand, PenLine, Eraser, StickyNote, Type,
-  Square, Circle, Triangle, Diamond, Star, MoveRight,
+  MousePointer2, PenLine, Eraser, StickyNote, Type,
+  Square, Circle, Triangle, Diamond, Star, MoveRight, Sparkles,
   ImageIcon, Undo2, Redo2, ZoomIn, ZoomOut, Maximize2,
   Share2, Play, Timer, Video, MessageSquare, MoreHorizontal,
   Copy, Trash2, Palette, X, ChevronDown, Check,
@@ -10,8 +10,17 @@ import {
 } from 'lucide-react';
 import { CanvasEngine } from './engine/CanvasEngine';
 import type { ToolType, StickyShape, AnyShape } from './engine/CanvasEngine';
-import { yShapes } from './store/useBoardStore';
+import { getCanvasShortcutAction } from './engine/keyboardShortcuts';
+import {
+  continueWithoutLocalRecovery, getBoardRuntimeStatus, initializeBoardStore, yShapes,
+} from './store/useBoardStore';
+import BoardStatusBanner from './store/BoardStatusBanner';
 import FormulaEditor from './formula/FormulaEditor';
+import FormulaEditorBoundary from './formula/FormulaEditorBoundary';
+import { DEFAULT_CODE_LANGUAGE, normalizeCodeLanguage, type CodeLanguage } from './code/languages';
+import { HIGH_CONTRAST_CURSORS, visibleCursor } from './cursors';
+
+const CodeEditor = React.lazy(() => import('./code/CodeEditor'));
 
 // ─── Palettes ─────────────────────────────────────────────────────────────────
 const PALETTE = ['#000000', '#f9a8d4', '#ef4444', '#f97316', '#22c55e', '#3b82f6', '#a855f7'];
@@ -22,67 +31,90 @@ const SELECT_TOOLS: { id: ToolType; Icon: React.FC<any>; label: string }[] = [
   { id: 'lasso-select', Icon: MousePointer2, label: 'Lasso Select' }, // Reuse icon for now
 ];
 
-const ERASER_TOOLS: { id: ToolType; Icon: React.FC<any>; label: string }[] = [
-  { id: 'eraser', Icon: Eraser, label: 'Object Eraser' },
-  { id: 'eraser-stroke', Icon: Eraser, label: 'Stroke Eraser' }, // Reuse icon for now
-];
-
 const TEXT_TOOLS: { id: ToolType; Icon: React.FC<any>; label: string }[] = [
   { id: 'text', Icon: Type, label: 'Text' },
   { id: 'math', Icon: Calculator, label: 'Math LaTeX' },
   { id: 'code', Icon: Code, label: 'Code Block' },
 ];
 
-const SHAPE_TOOLS: { id: ToolType; Icon: React.FC<any>; label: string }[] = [
+type AddedShapeTool = Extract<ToolType, 'pentagon' | 'hexagon' | 'parallelogram' | 'trapezoid' | 'right-triangle'>;
+
+function ShapeGlyph({ kind, size = 16 }: { kind: AddedShapeTool; size?: number }) {
+  const points: Record<AddedShapeTool, string> = {
+    pentagon: '12,2 21.5,9 18,21 6,21 2.5,9',
+    hexagon: '12,2 21,7 21,17 12,22 3,17 3,7',
+    parallelogram: '7,3 22,3 17,21 2,21',
+    trapezoid: '6,3 18,3 22,21 2,21',
+    'right-triangle': '3,3 21,21 3,21',
+  };
+  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <polygon points={points[kind]} stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+  </svg>;
+}
+
+const PentagonIcon: React.FC<{ size?: number }> = ({ size }) => <ShapeGlyph kind="pentagon" size={size} />;
+const HexagonIcon: React.FC<{ size?: number }> = ({ size }) => <ShapeGlyph kind="hexagon" size={size} />;
+const ParallelogramIcon: React.FC<{ size?: number }> = ({ size }) => <ShapeGlyph kind="parallelogram" size={size} />;
+const TrapezoidIcon: React.FC<{ size?: number }> = ({ size }) => <ShapeGlyph kind="trapezoid" size={size} />;
+const RightTriangleIcon: React.FC<{ size?: number }> = ({ size }) => <ShapeGlyph kind="right-triangle" size={size} />;
+
+const BASIC_SHAPE_TOOLS: { id: ToolType; Icon: React.FC<any>; label: string }[] = [
   { id: 'rect', Icon: Square, label: 'Rectangle' },
-  { id: 'rounded-rect', Icon: AppWindow, label: 'Rounded Rect' },
-  { id: 'ellipse', Icon: Circle, label: 'Circle' },
+  { id: 'rounded-rect', Icon: AppWindow, label: 'Rounded rectangle' },
+  { id: 'ellipse', Icon: Circle, label: 'Ellipse' },
   { id: 'diamond', Icon: Diamond, label: 'Diamond' },
   { id: 'star', Icon: Star, label: 'Star' },
   { id: 'triangle', Icon: Triangle, label: 'Triangle' },
   { id: 'callout', Icon: MessageSquare, label: 'Callout' },
   { id: 'arrow', Icon: MoveRight, label: 'Arrow' },
 ];
+const ADDITIONAL_SHAPE_TOOLS: { id: ToolType; Icon: React.FC<any>; label: string }[] = [
+  { id: 'pentagon', Icon: PentagonIcon, label: 'Pentagon' },
+  { id: 'hexagon', Icon: HexagonIcon, label: 'Hexagon' },
+  { id: 'parallelogram', Icon: ParallelogramIcon, label: 'Parallelogram' },
+  { id: 'trapezoid', Icon: TrapezoidIcon, label: 'Trapezoid' },
+  { id: 'right-triangle', Icon: RightTriangleIcon, label: 'Right triangle' },
+];
+const SHAPE_TOOLS = [...BASIC_SHAPE_TOOLS, ...ADDITIONAL_SHAPE_TOOLS];
+
+type PopoverGroup = 'pen' | 'shapes' | 'text' | 'select';
 
 // Math symbols và auto-replace đã được chuyển sang formula/parser.ts
 // MATH_SYMBOLS và AUTO_REPLACE không còn cần ở đây
 
 function PopoverItem({ active, onClick, Icon, label, grid }: { active: boolean; onClick: (e: React.MouseEvent) => void; Icon: any; label: string; grid?: boolean }) {
-  if (grid) {
-    return (
-      <button onClick={onClick} title={label}
-        className={`w-10 h-10 flex items-center justify-center rounded-lg transition-all ${active ? 'bg-[#F2A310]/15' : 'text-gray-500 hover:bg-gray-100 hover:text-gray-900'}`}>
-        <Icon size={18} className={active ? 'text-[#F2A310]' : ''} />
-      </button>
-    );
-  }
   return (
-    <button onClick={onClick} title={label}
-      className={`w-full flex items-center gap-3 px-3 h-10 rounded-lg transition-all ${active ? 'bg-[#F2A310]/15' : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900 font-medium'}`}>
-      <div className={`p-1.5 rounded-md ${active ? 'bg-transparent text-[#F2A310]' : 'bg-gray-100 text-gray-400'}`}>
-        <Icon size={14} />
-      </div>
-      <span className={`text-[13px] ${active ? 'font-bold text-[#111]' : 'font-medium text-gray-700'}`}>{label}</span>
-      {active && <Check size={14} className="ml-auto text-[#F2A310] stroke-[2.5px]" />}
+    <button type="button" onClick={onClick} title={label} aria-label={label} aria-pressed={active}
+      className={`popover-item${grid ? ' popover-shape-item' : ''}`}>
+      <span className="popover-item-icon"><Icon size={grid ? 16 : 15} /></span>
+      <span className="popover-item-label">{label}</span>
+      {active && <Check size={15} className="popover-item-check" aria-hidden="true" />}
     </button>
   );
 }
 
-function SideBtn({ label, active, onClick, children }: { label: string; active?: boolean; onClick: (e: React.MouseEvent) => void; children: React.ReactNode }) {
+function SideBtn({ label, active, expanded, buttonRef, onClick, children }: { label: string; active?: boolean; expanded?: boolean; buttonRef?: React.Ref<HTMLButtonElement>; onClick: (e: React.MouseEvent) => void; children: React.ReactNode }) {
   return (
-    <button onClick={onClick}
-      className={[
-        'relative group w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-100',
-        active
-          ? 'bg-[#F2A310] text-[#111] shadow-[0_2px_10px_rgba(242,163,16,.5)]'
-          : 'text-white/50 hover:text-white hover:bg-white/[.11]',
-      ].join(' ')}>
+    <button ref={buttonRef} type="button" onClick={onClick} aria-label={label} title={label} aria-pressed={active} aria-expanded={expanded}
+      className="side-btn">
       {children}
-      <span className="pointer-events-none absolute left-[calc(100%+10px)] top-1/2 -translate-y-1/2 z-[9999] px-2 py-1 rounded-lg bg-gray-900 text-white text-[11px] font-medium whitespace-nowrap opacity-0 scale-95 group-hover:opacity-100 group-hover:scale-100 transition-all duration-150 shadow-xl">
-        {label}
-      </span>
+      <span className="side-tooltip" aria-hidden="true">{label}</span>
     </button>
   );
+}
+
+function estimateCodeCursor(source: string, clientX: number, clientY: number, box: { l: number; t: number }, zoom: number, fontSize: number): number {
+  const safeZoom = Math.max(0.04, zoom);
+  const lines = source.split('\n');
+  const lineHeight = Math.max(12, fontSize * 1.55);
+  const columnWidth = Math.max(6, fontSize * 0.6);
+  const localX = (clientX - box.l) / safeZoom - 54;
+  const localY = (clientY - box.t) / safeZoom - 44;
+  const row = Math.max(0, Math.min(lines.length - 1, Math.floor(localY / lineHeight)));
+  let offset = 0;
+  for (let index = 0; index < row; index++) offset += lines[index].length + 1;
+  const column = Math.max(0, Math.min(lines[row]?.length ?? 0, Math.round(localX / columnWidth)));
+  return offset + column;
 }
 
 // Removed ColorSwatch as it was declared but never read.
@@ -100,6 +132,7 @@ export default function App() {
   const [zoom, setZoom] = useState(1);
   const [cam, setCam] = useState({ x: 0, y: 0, zoom: 1 }); // Sync camera to React for overlays
   const [cursor, setCursor] = useState('crosshair');
+  const renderedCursor = visibleCursor(cursor);
   const [boardName, setBoardName] = useState('Untitled');
   const [editName, setEditName] = useState(false);
   const [selIds, setSelIds] = useState<string[]>([]);
@@ -107,17 +140,24 @@ export default function App() {
   // text/sticky edit overlay
   const [editShape, setEditShape] = useState<AnyShape | null>(null);
   const editShapeRef = useRef<AnyShape | null>(null);
+  const editTextRef = useRef('');
   const internalSetEditShape = (s: AnyShape | null) => {
     setEditShape(s);
     editShapeRef.current = s;
+    if (!s) editTextRef.current = '';
   };
 
   const [editText, setEditText] = useState('');
+  const [boardReady, setBoardReady] = useState(false);
+  const [boardRestoreError, setBoardRestoreError] = useState<string | null>(null);
+  const [editLanguage, setEditLanguage] = useState<CodeLanguage>(DEFAULT_CODE_LANGUAGE);
   const [editBox, setEditBox] = useState({ l: 0, t: 0, w: 0, h: 0 });
   const [editClick, setEditClick] = useState({ x: 0, y: 0 });
 
   // style panel
   const [panelOpen, setPanelOpen] = useState(false);
+  const panelRef = useRef<HTMLDivElement>(null);
+  const panelTriggerRef = useRef<HTMLButtonElement>(null);
   const [penColor, setPenColor] = useState('#ef4444');
   const [penSize, setPenSize] = useState(6);
   const [fill, setFill] = useState('transparent');
@@ -126,11 +166,14 @@ export default function App() {
   const [stickyBg, setStickyBg] = useState('#fef08a');
   const [fontSize, setFontSize] = useState(14);
 
-  const [openGroup, setOpenGroup] = useState<'shapes' | 'text' | 'select' | 'eraser' | null>(null);
+  const [openGroup, setOpenGroup] = useState<PopoverGroup | null>(null);
+  const [penMode, setPenMode] = useState<'normal' | 'smart'>('normal');
+  const popoverAnchorRefs = useRef<Record<PopoverGroup, HTMLDivElement | null>>({ pen: null, shapes: null, text: null, select: null });
+  const popoverPanelRef = useRef<HTMLDivElement>(null);
+  const [popoverPosition, setPopoverPosition] = useState<{ left: number; top: number } | null>(null);
   const [lastTextTool, setLastTextTool] = useState<ToolType>('text');
   const [lastShapeTool, setLastShapeTool] = useState<ToolType>('rect');
   const [lastSelectTool, setLastSelectTool] = useState<ToolType>('select');
-  const [lastEraserTool, setLastEraserTool] = useState<ToolType>('eraser');
 
   const setTool = (t: ToolType, keepOpen: boolean = false) => {
     setToolSt(t);
@@ -140,13 +183,128 @@ export default function App() {
     if (['text', 'math', 'code'].includes(t)) setLastTextTool(t);
     if (SHAPE_TOOLS.some(s => s.id === t)) setLastShapeTool(t);
     if (['select', 'lasso-select'].includes(t)) setLastSelectTool(t);
-    if (['eraser', 'eraser-stroke'].includes(t)) setLastEraserTool(t);
   };
 
-  // ── init engine ────────────────────────────────────────────────────────
+  const choosePopoverTool = (t: ToolType) => {
+    const group = openGroup;
+    setTool(t);
+    if (group) popoverAnchorRefs.current[group]?.querySelector('button')?.focus();
+  };
+
+  const choosePenMode = (mode: 'normal' | 'smart') => {
+    setPenMode(mode);
+    engRef.current?.setPenMode(mode);
+    setTool('pen');
+    popoverAnchorRefs.current.pen?.querySelector('button')?.focus();
+  };
+
+  const handlePopoverNavigation = useCallback((e: React.KeyboardEvent<HTMLElement>) => {
+    const keys = ['ArrowDown', 'ArrowUp', 'ArrowRight', 'ArrowLeft', 'Home', 'End'];
+    if (!keys.includes(e.key)) return;
+    const items = Array.from(popoverPanelRef.current?.querySelectorAll<HTMLButtonElement>('button:not(:disabled)') ?? []);
+    if (!items.length) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    const current = items.indexOf(document.activeElement as HTMLButtonElement);
+    let next = current;
+    if (e.key === 'Home') next = 0;
+    else if (e.key === 'End') next = items.length - 1;
+    else if (e.key === 'ArrowDown' || e.key === 'ArrowRight') next = current < 0 ? 0 : (current + 1) % items.length;
+    else next = current < 0 ? items.length - 1 : (current - 1 + items.length) % items.length;
+    items[next].focus();
+  }, []);
+
+  const closeStylePanel = useCallback((restoreFocus = false) => {
+    setPanelOpen(false);
+    if (restoreFocus) window.requestAnimationFrame(() => panelTriggerRef.current?.focus());
+  }, []);
+
+  useEffect(() => {
+    if (!panelOpen) return;
+    const firstFocusable = panelRef.current?.querySelector<HTMLElement>(
+      'button:not(:disabled), input:not(:disabled):not([type="hidden"]), select:not(:disabled), textarea:not(:disabled)'
+    );
+    firstFocusable?.focus();
+  }, [panelOpen]);
+
+  const handleStylePanelKeyDown = useCallback((e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      e.stopPropagation();
+      closeStylePanel(true);
+      return;
+    }
+    if (e.key !== 'Tab') return;
+
+    const panel = panelRef.current;
+    if (!panel) return;
+    const focusable = Array.from(panel.querySelectorAll<HTMLElement>(
+      'button:not(:disabled), input:not(:disabled):not([type="hidden"]), select:not(:disabled), textarea:not(:disabled)'
+    )).filter(element => element.getClientRects().length > 0);
+    if (focusable.length === 0) {
+      e.preventDefault();
+      return;
+    }
+
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    const active = document.activeElement;
+    if (e.shiftKey && (active === first || !panel.contains(active))) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && (active === last || !panel.contains(active))) {
+      e.preventDefault();
+      first.focus();
+    }
+  }, [closeStylePanel]);
+
+  useLayoutEffect(() => {
+    if (!openGroup) {
+      setPopoverPosition(null);
+      return;
+    }
+    const anchor = popoverAnchorRefs.current[openGroup];
+    const panel = popoverPanelRef.current;
+    if (!anchor || !panel) return;
+
+    const placePopover = () => {
+      const anchorRect = anchor.getBoundingClientRect();
+      const panelRect = panel.getBoundingClientRect();
+      const margin = 8;
+      const maxLeft = Math.max(margin, window.innerWidth - panelRect.width - margin);
+      let left = anchorRect.right + 8;
+      if (left > maxLeft) left = anchorRect.left - panelRect.width - 8;
+      left = Math.max(margin, Math.min(left, maxLeft));
+      const maxTop = Math.max(margin, window.innerHeight - panelRect.height - margin);
+      const top = Math.max(margin, Math.min(anchorRect.top, maxTop));
+      setPopoverPosition({ left, top });
+    };
+
+    placePopover();
+    window.addEventListener('resize', placePopover);
+    return () => window.removeEventListener('resize', placePopover);
+  }, [openGroup]);
+
+  const beginBoardInitialization = useCallback(() => {
+    setBoardRestoreError(null);
+    setBoardReady(false);
+    void initializeBoardStore().then(() => {
+      setBoardReady(true);
+    }).catch(error => {
+      const status = getBoardRuntimeStatus();
+      setBoardRestoreError(status.message || (error instanceof Error ? error.message : String(error)));
+    });
+  }, []);
+
+  useEffect(() => {
+    beginBoardInitialization();
+  }, [beginBoardInitialization]);
+
+  // ── init engine only after local content has been restored ─────────────
   useEffect(() => {
     const cv = canvasRef.current, wrap = wrapRef.current;
-    if (!cv || !wrap || engRef.current) return;
+    if (!boardReady || !cv || !wrap || engRef.current) return;
 
     // set canvas physical pixels = container size
     cv.width = wrap.clientWidth;
@@ -173,17 +331,18 @@ export default function App() {
     };
 
     eng.onShapeUpdate = s => {
-      // If we are editing THIS shape and it's being resized/moved, sync EVERYTHING!
-      if (editShapeRef.current?.id === s.id && 'x' in s && 'y' in s) {
-        const sp = eng.worldToClient((s as any).x, (s as any).y);
-        setEditBox({
-          l: sp.x,
-          t: sp.y,
-          w: (s as any).w * eng.cam.zoom,
-          h: (s as any).h * eng.cam.zoom,
-        });
-        internalSetEditShape(s); // Update the state object so App.tsx knows the latest FS/W/H/X/Y
+      if (editShapeRef.current?.id !== s.id) return;
+      const updated = s as any;
+      if (typeof updated.text === 'string') {
+        editTextRef.current = updated.text;
+        if (updated.type !== 'math') setEditText(current => current === updated.text ? current : updated.text);
       }
+      if (updated.type === 'code') setEditLanguage(normalizeCodeLanguage(updated.language));
+      if ('x' in updated && 'y' in updated) {
+        const sp = eng.worldToClient(updated.x, updated.y);
+        setEditBox({ l: sp.x, t: sp.y, w: updated.w * eng.cam.zoom, h: updated.h * eng.cam.zoom });
+      }
+      internalSetEditShape(s);
     };
 
     // Global measurement helper for smart resize
@@ -235,34 +394,42 @@ export default function App() {
       });
       setEditClick({ x: cx, y: cy });
       internalSetEditShape(shape);
+      editTextRef.current = s.text || '';
       setEditText(s.text || '');
+      setEditLanguage(normalizeCodeLanguage(s.language));
     };
 
     // Global click listener to close popovers when hitting board/outside
     const h = (e: MouseEvent) => {
       const target = e.target as HTMLElement;
-      if (!target.closest('.group/pop') && !target.closest('aside')) {
+      if (!target.closest('aside')) {
         setOpenGroup(null);
       }
     };
     window.addEventListener('mousedown', h, true);
 
-    // wheel: zoom or pan
+    // Wheel zoom is camera-centered on the pointer. Editable UI and native scroll areas retain their wheel behavior.
     const onWheel = (e: WheelEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target?.closest('.no-canvas, .panel-ui, .toolbar, .popover, .formula-editor-panel, .math-tools-panel, .code-editor-shell, .board-sticky-overlay, .board-code-preview, input, textarea, select, [contenteditable="true"], [role="dialog"]')) return;
+      if (!e.deltaY) return;
+      const unit = e.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : e.deltaMode === WheelEvent.DOM_DELTA_PAGE ? wrap.clientHeight : 1;
+      const delta = Math.max(-160, Math.min(160, e.deltaY * unit));
+      const factor = Math.max(0.8, Math.min(1.25, Math.exp(-delta * 0.00125)));
       e.preventDefault();
-      if (e.ctrlKey || e.metaKey) {
-        eng.zoomAt(e.clientX, e.clientY, e.deltaY < 0 ? 1.1 : 0.9);
-      } else {
-        eng.panBy(e.deltaX, e.deltaY);
-      }
+      eng.zoomAt(e.clientX, e.clientY, factor);
     };
-    cv.addEventListener('wheel', onWheel, { passive: false });
+    wrap.addEventListener('wheel', onWheel, { passive: false });
 
-    // pointer events on window so drag works outside canvas
+    // Window listeners keep drawing, erasing, and panning coherent outside the canvas bounds.
     const onMove = (e: PointerEvent) => eng.pointerMove(e);
-    const onUp = (e: PointerEvent) => { if (e.button !== 1) eng.pointerUp(); };
+    const onUp = (e: PointerEvent) => eng.pointerUp(e);
+    const onCancel = () => eng.cancelPointer();
+    const onBlur = () => eng.cancelPointer();
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
+    window.addEventListener('pointercancel', onCancel);
+    window.addEventListener('blur', onBlur);
 
     // resize → update canvas size
     const ro = new ResizeObserver(() => {
@@ -275,19 +442,24 @@ export default function App() {
     return () => {
       ro.disconnect();
       window.removeEventListener('mousedown', h, true);
-      cv.removeEventListener('wheel', onWheel);
+      wrap.removeEventListener('wheel', onWheel);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
+      window.removeEventListener('pointercancel', onCancel);
+      window.removeEventListener('blur', onBlur);
+      eng.cancelPointer();
       eng.destroy();
       engRef.current = null;
     };
-  }, []);
+  }, [boardReady]);
 
   // sync style options
   useEffect(() => {
     const eng = engRef.current; if (!eng) return;
     eng.style = { penColor, penSize, fill, stroke, sw, stickyBg, fontSize };
   }, [penColor, penSize, fill, stroke, sw, stickyBg, fontSize]);
+
+  useEffect(() => { engRef.current?.setPenMode(penMode); }, [penMode]);
 
   // document title
   useEffect(() => { document.title = `${boardName} - Antiwhite`; }, [boardName]);
@@ -313,63 +485,94 @@ export default function App() {
     }
   }, [zoom, editShape]);
 
-  // Math Auto-Replace đã được chuyển sang FormulaEditor component
-  // Telex parser xử lý auto-replace khi gõ Space
+  const handleFormulaSourceChange = useCallback((source: string, lastValidPreview?: string) => {
+    editTextRef.current = source;
+    const current = editShapeRef.current;
+    if (current?.type !== 'math') return;
+    const stored = yShapes.get(current.id);
+    const fallbackPreview = stored?.type === 'math' ? stored.previewText : current.previewText;
+    // Source remains authoritative; only a valid preview is allowed to update the board projection.
+    engRef.current?.updateFormulaLive(current.id, source, lastValidPreview ?? fallbackPreview ?? '', false);
+  }, []);
 
-  // keyboard shortcuts
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      const tag = (document.activeElement as HTMLElement)?.tagName;
-      if (tag === 'INPUT' || tag === 'TEXTAREA') return;
-      if (editShape) { if (e.key === 'Escape') commitEdit(); return; }
-      const eng = engRef.current; if (!eng) return;
+  const getLastValidFormulaPreview = useCallback(() => {
+    const current = editShapeRef.current;
+    if (current?.type !== 'math') return '';
+    const stored = yShapes.get(current.id);
+    return stored?.type === 'math' ? (stored.previewText ?? '') : (current.previewText ?? '');
+  }, []);
 
-      // Arrow panning
-      if (eng.sel.size === 0 && ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.key)) {
-        e.preventDefault();
-        const pd = 50;
-        if (e.key === 'ArrowUp') eng.panBy(0, pd);
-        if (e.key === 'ArrowDown') eng.panBy(0, -pd);
-        if (e.key === 'ArrowLeft') eng.panBy(pd, 0);
-        if (e.key === 'ArrowRight') eng.panBy(-pd, 0);
-        return;
-      }
+  // Math Auto-Replace đã được chuyển sang FormulaEditor component.
 
-      const ctrl = e.ctrlKey || e.metaKey;
-      if (ctrl && e.key === 'z') { e.preventDefault(); eng.undo(); }
-      else if (ctrl && (e.key === 'y' || e.key === 'Z')) { e.preventDefault(); eng.redo(); }
-      else if (ctrl && e.key === 'd') { e.preventDefault(); eng.dupSel(); }
-      else if (e.key === 'Delete' || e.key === 'Backspace') eng.deleteSel();
-      else {
-        const m: Record<string, ToolType | 'img'> = {
-          v: 'select', h: 'hand', p: 'pen', e: 'eraser', s: 'sticky',
-          t: 'text', r: 'rect', o: 'ellipse', a: 'arrow', i: 'img',
-        };
-        const act = m[e.key.toLowerCase()];
-        if (act === 'img') fileRef.current?.click();
-        else if (act) setTool(act);
-        else if (e.key === 'Escape') {
-          eng.sel.clear(); setSelIds([]); eng.mark();
-        }
-      }
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [editShape, setTool]);
-
-  const commitEdit = useCallback(() => {
+  const commitEdit = useCallback((formulaSource?: string, lastValidPreview?: string) => {
     if (!editShape) return;
     const eng = engRef.current;
     if (!eng) return;
 
+    const committedText = editShape.type === 'math' ? (formulaSource ?? editTextRef.current) : editText;
     eng.setEditingId(null);
-    if (editText.trim() === '') {
+    if (editShape.type === 'math') {
+      const storedPreview = getLastValidFormulaPreview() ?? editShape.text ?? '';
+      const previewText = lastValidPreview ?? storedPreview;
+      if (!committedText.trim() && !previewText.trim()) eng.deleteShape(editShape.id);
+      else eng.updateFormula(editShape.id, committedText, previewText);
+    } else if (committedText.trim() === '') {
       eng.deleteShape(editShape.id);
+    } else if (editShape.type === 'code') {
+      eng.updateCode(editShape.id, committedText, editLanguage);
     } else {
-      eng.updateText(editShape.id, editText);
+      eng.updateText(editShape.id, committedText);
     }
     internalSetEditShape(null);
-  }, [editShape, editText]);
+  }, [editShape, editText, editLanguage, getLastValidFormulaPreview]);
+
+  // keyboard shortcuts
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const active = document.activeElement as HTMLElement | null;
+      const tag = active?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || active?.isContentEditable) return;
+      if (active?.closest('button, a, select, [role="dialog"], [role="menu"], [role="listbox"], .board-code-preview')) return;
+      if (editShape) { if (e.key === 'Escape') commitEdit(); return; }
+      const eng = engRef.current; if (!eng) return;
+
+      const shortcut = getCanvasShortcutAction(e, eng.sel.size === 0);
+      if (!shortcut) return;
+      switch (shortcut.type) {
+        case 'pan':
+          e.preventDefault();
+          eng.panBy(shortcut.dx, shortcut.dy);
+          break;
+        case 'undo': e.preventDefault(); eng.undo(); break;
+        case 'redo': e.preventDefault(); eng.redo(); break;
+        case 'duplicate': e.preventDefault(); eng.dupSel(); break;
+        case 'delete': eng.deleteSel(); break;
+        case 'tool': setTool(shortcut.tool); break;
+        case 'open-image': fileRef.current?.click(); break;
+        case 'clear-selection':
+          eng.sel.clear(); setSelIds([]); eng.mark();
+          break;
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [editShape, setTool, commitEdit]);
+
+  const resizeFormula = useCallback((width: number, height: number) => {
+    const id = editShapeRef.current?.id;
+    if (id) engRef.current?.updateSize(id, width, height);
+  }, []);
+
+  const moveFormula = useCallback((x: number, y: number) => {
+    const id = editShapeRef.current?.id;
+    if (id) engRef.current?.updatePos(id, x, y);
+  }, []);
+
+  const editShapeFontSize = editShape && 'fs' in editShape ? editShape.fs : 14;
+  const formulaFontSize = editShape?.type === 'math' ? editShapeFontSize : 14;
+  const codeEditorInitialCursor = editShape?.type === 'code'
+    ? estimateCodeCursor(editText, editClick.x, editClick.y, editBox, zoom, editShapeFontSize)
+    : undefined;
 
   // image: capture cursor position at click, then open file dialog
   const onImageToolClick = (e: React.MouseEvent) => {
@@ -399,54 +602,64 @@ export default function App() {
   const resetZoom = () => engRef.current?.setCamera(0, 0, 1);
 
   return (
-    <div className="w-screen h-screen flex flex-col overflow-hidden select-none"
-      style={{ fontFamily: "'Inter','Segoe UI',system-ui,sans-serif", background: '#f8f8f5' }}>
+    <div className="app-shell flex flex-col overflow-hidden select-none" style={{
+      '--aw-cursor-pointer': HIGH_CONTRAST_CURSORS.pointer,
+      '--aw-cursor-text': HIGH_CONTRAST_CURSORS.text,
+      '--aw-cursor-grab': HIGH_CONTRAST_CURSORS.grab,
+      '--aw-cursor-grabbing': HIGH_CONTRAST_CURSORS.grabbing,
+      '--aw-cursor-move': HIGH_CONTRAST_CURSORS.move,
+    } as React.CSSProperties}>
 
       {/* ══ TOPBAR ══════════════════════════════════════════════════════════ */}
-      <header style={{ background: 'linear-gradient(180deg,#1e2235,#1a1d2e)', height: 48, flexShrink: 0 }}
-        className="flex items-center px-3 gap-2 z-[1000] border-b border-white/[.06] shadow-[0_1px_16px_rgba(0,0,0,.4)]">
-        <div className="flex items-center gap-2 pr-3 border-r border-white/[.12] shrink-0 cursor-pointer">
-          <svg width="26" height="26" viewBox="0 0 28 28"><rect width="28" height="28" rx="6" fill="#F2A310" /><path d="M7 20l7-12 7 12h-2.5l-1.5-3h-6l-1.5 3H7zm4-5h6l-3-6-3 6z" fill="#111" /></svg>
-          <span className="text-white font-bold text-[17px] tracking-[-0.4px]">antiwhite</span>
+      <header className="app-header">
+        <div className="header-brand">
+          <svg className="brand-mark" width="28" height="28" viewBox="0 0 28 28" aria-hidden="true">
+            <rect width="28" height="28" rx="7" fill="#F2A310" />
+            <path d="M7 20l7-12 7 12h-2.5l-1.5-3h-6l-1.5 3H7zm4-5h6l-3-6-3 6z" fill="#111" />
+          </svg>
+          <span className="header-brand-label">antiwhite</span>
         </div>
+        <span className="header-divider" aria-hidden="true" />
 
-        <div className="flex items-center gap-1 min-w-0">
-          <span className="text-white/35 text-[13px] shrink-0">Boards /</span>
+        <div className="header-board">
+          <span className="header-breadcrumb">Boards</span>
+          <span className="header-crumb-separator" aria-hidden="true">/</span>
           {editName ? (
-            <input ref={nameRef} value={boardName}
+            <input ref={nameRef} value={boardName} aria-label="Board name"
               onChange={e => setBoardName(e.target.value || 'Untitled')}
               onBlur={() => setEditName(false)}
               onKeyDown={e => { if (e.key === 'Enter' || e.key === 'Escape') { e.preventDefault(); setEditName(false); } }}
-              className="text-white text-[13px] font-semibold bg-white/10 border border-white/25 rounded-md px-2 py-0.5 outline-none min-w-[100px] max-w-[220px]"
+              className="header-name-input"
               autoFocus />
           ) : (
             <button onClick={() => { setEditName(true); setTimeout(() => nameRef.current?.select(), 15); }}
-              className="flex items-center gap-1 text-white text-[13px] font-semibold px-2 py-0.5 rounded-md hover:bg-white/10 transition-colors group/n">
-              <span className="truncate max-w-[180px]">{boardName}</span>
-              <ChevronDown size={12} className="text-white/35 group-hover/n:text-white/60 shrink-0" />
+              className="header-board-name">
+              <span className="header-board-title">{boardName}</span>
+              <ChevronDown size={14} aria-hidden="true" />
             </button>
           )}
         </div>
 
-        <div className="flex-1" />
-
-        <div className="flex items-center gap-0.5 shrink-0">
-          <div className="flex -space-x-1.5 mr-2">
+        <div className="header-spacer" />
+        <div className="header-presence" role="img" aria-label="Sample collaborator avatars; collaboration is not connected">
+          <span className="presence-label">Sample</span>
+          <div className="presence-avatars" aria-hidden="true">
             {['#6366f1', '#22c55e', '#f97316'].map((c, i) => (
-              <div key={i} className="w-7 h-7 rounded-full border-2 border-[#1a1d2e] flex items-center justify-center text-[10px] font-bold text-white"
-                style={{ background: c, zIndex: 3 - i }}>{String.fromCharCode(65 + i)}</div>
+              <div key={i} className="presence-avatar" style={{ background: c, zIndex: 3 - i }}>{String.fromCharCode(65 + i)}</div>
             ))}
           </div>
-          <button className="flex items-center gap-1.5 px-3 h-8 rounded-lg border border-white/[.18] text-white/70 hover:text-white hover:bg-white/[.09] text-[12px] font-medium transition-all">
-            <Play size={11} strokeWidth={2.5} className="fill-current" /> Present
+        </div>
+        <span className="header-action-divider" aria-hidden="true" />
+        <div className="header-actions">
+          <button type="button" disabled title="Presentation is not available yet" aria-label="Present (not available yet)"
+            className="header-action header-action-secondary">
+            <Play size={14} strokeWidth={2.25} className="fill-current" /><span className="header-action-label">Present</span>
           </button>
-          <button className="flex items-center gap-1.5 px-3.5 h-8 rounded-lg text-[#111] text-[12px] font-bold ml-1"
-            style={{ background: '#F2A310' }}
-            onMouseEnter={e => (e.currentTarget.style.background = '#f5b820')}
-            onMouseLeave={e => (e.currentTarget.style.background = '#F2A310')}>
-            <Share2 size={12} strokeWidth={2.5} /> Share
+          <button type="button" disabled title="Sharing is not available yet" aria-label="Share (not available yet)"
+            className="header-action header-action-primary">
+            <Share2 size={14} strokeWidth={2.25} /><span className="header-action-label">Share</span>
           </button>
-          <div className="w-8 h-8 rounded-full ml-2 bg-gradient-to-br from-violet-500 to-sky-400 flex items-center justify-center text-[11px] font-bold text-white border-2 border-[#1a1d2e] cursor-pointer shrink-0">U</div>
+          <div className="header-user-avatar" aria-hidden="true">U</div>
         </div>
       </header>
 
@@ -454,12 +667,22 @@ export default function App() {
       <div className="flex flex-1 min-h-0 overflow-hidden">
 
         {/* SIDEBAR */}
-        <aside style={{ background: 'linear-gradient(180deg,#1e2235,#1a1d2e)', width: 56, flexShrink: 0 }}
-          className="flex flex-col items-center py-2 z-[1000] border-r border-white/[.06] shadow-[2px_0_12px_rgba(0,0,0,.2)] overflow-visible relative">
-          <div className="flex flex-col items-center gap-0.5 w-full px-2">
+        <aside onKeyDown={e => {
+          if (!openGroup) return;
+          if (e.key === 'Escape') {
+            e.preventDefault();
+            e.stopPropagation();
+            const group = openGroup;
+            setOpenGroup(null);
+            popoverAnchorRefs.current[group]?.querySelector('button')?.focus();
+          } else {
+            handlePopoverNavigation(e);
+          }
+        }} className="tool-rail">
+          <div className="tool-stack">
             {/* SELECT GROUP */}
-            <div className="relative group/pop w-full flex justify-center">
-              <SideBtn label="Select Tools" active={['select', 'lasso-select'].includes(tool)}
+            <div ref={el => { popoverAnchorRefs.current.select = el }} className="tool-group">
+              <SideBtn label="Select Tools" active={['select', 'lasso-select'].includes(tool)} expanded={openGroup === 'select'}
                 onClick={() => { const next = openGroup === 'select' ? null : 'select'; setOpenGroup(next); if (next) setTool(lastSelectTool, true); }}>
                 {(() => {
                   const active = ['select', 'lasso-select'].includes(tool) ? tool : lastSelectTool;
@@ -468,42 +691,38 @@ export default function App() {
                 })()}
               </SideBtn>
               {openGroup === 'select' && (
-                <div className="absolute left-full ml-2 top-0 bg-white p-2 rounded-xl shadow-2xl border border-gray-100 z-[100] flex flex-col gap-1 w-48">
+                <div ref={popoverPanelRef} className="tool-popover tool-popover-list" role="group" aria-label="Selection tools" onKeyDown={handlePopoverNavigation}
+                  style={{ left: popoverPosition?.left ?? -9999, top: popoverPosition?.top ?? -9999 }}>
+                  <div className="tool-popover-heading">Selection mode</div>
                   {SELECT_TOOLS.map(t => (
-                    <PopoverItem key={t.id} active={(tool === 'select' || tool === 'lasso-select') ? tool === t.id : lastSelectTool === t.id} Icon={t.Icon} label={t.label} onClick={() => { setTool(t.id); }} />
+                    <PopoverItem key={t.id} active={(tool === 'select' || tool === 'lasso-select') ? tool === t.id : lastSelectTool === t.id} Icon={t.Icon} label={t.label} onClick={() => { choosePopoverTool(t.id); }} />
                   ))}
                 </div>
               )}
             </div>
 
-            <SideBtn label="Hand (H)" active={tool === 'hand'} onClick={() => setTool('hand')}><Hand size={17} /></SideBtn>
-            <div className="w-7 h-px bg-white/10 my-1.5" />
-            <SideBtn label="Pen (P)" active={tool === 'pen'} onClick={() => setTool('pen')}><PenLine size={17} /></SideBtn>
-
-            {/* ERASER GROUP */}
-            <div className="relative group/pop w-full flex justify-center">
-              <SideBtn label="Eraser Tools" active={['eraser', 'eraser-stroke'].includes(tool)}
-                onClick={() => { const next = openGroup === 'eraser' ? null : 'eraser'; setOpenGroup(next); if (next) setTool(lastEraserTool, true); }}>
-                {(() => {
-                  const active = ['eraser', 'eraser-stroke'].includes(tool) ? tool : lastEraserTool;
-                  const entry = ERASER_TOOLS.find(t => t.id === active);
-                  return entry ? <entry.Icon size={17} /> : <Eraser size={17} />;
-                })()}
+            <div className="tool-divider" aria-hidden="true" />
+            <div ref={el => { popoverAnchorRefs.current.pen = el }} className="tool-group">
+              <SideBtn label="Pen modes" active={tool === 'pen'} expanded={openGroup === 'pen'}
+                onClick={() => { const next = openGroup === 'pen' ? null : 'pen'; setOpenGroup(next); if (next) setTool('pen', true); }}>
+                {penMode === 'smart' ? <Sparkles size={17} /> : <PenLine size={17} />}
               </SideBtn>
-              {openGroup === 'eraser' && (
-                <div className="absolute left-full ml-2 top-0 bg-white p-2 rounded-xl shadow-2xl border border-gray-100 z-[100] flex flex-col gap-1 w-48">
-                  {ERASER_TOOLS.map(t => (
-                    <PopoverItem key={t.id} active={(tool === 'eraser' || tool === 'eraser-stroke') ? tool === t.id : lastEraserTool === t.id} Icon={t.Icon} label={t.label} onClick={() => { setTool(t.id); }} />
-                  ))}
+              {openGroup === 'pen' && (
+                <div ref={popoverPanelRef} className="tool-popover tool-popover-list" role="group" aria-label="Pen drawing modes" onKeyDown={handlePopoverNavigation}
+                  style={{ left: popoverPosition?.left ?? -9999, top: popoverPosition?.top ?? -9999 }}>
+                  <div className="tool-popover-heading">Pen mode</div>
+                  <PopoverItem active={penMode === 'normal'} Icon={PenLine} label="Normal" onClick={() => choosePenMode('normal')} />
+                  <PopoverItem active={penMode === 'smart'} Icon={Sparkles} label="Smart Drawing" onClick={() => choosePenMode('smart')} />
                 </div>
               )}
             </div>
-            <div className="w-7 h-px bg-white/10 my-1.5" />
+            <SideBtn label="Eraser" active={tool === 'eraser'} onClick={() => setTool('eraser')}><Eraser size={17} /></SideBtn>
+            <div className="tool-divider" aria-hidden="true" />
             <SideBtn label="Sticky (S)" active={tool === 'sticky'} onClick={() => setTool('sticky')}><StickyNote size={17} /></SideBtn>
 
             {/* TEXT GROUP */}
-            <div className="relative group/pop w-full flex justify-center">
-              <SideBtn label="Text Tools" active={['text', 'math', 'code'].includes(tool)}
+            <div ref={el => { popoverAnchorRefs.current.text = el }} className="tool-group">
+              <SideBtn label="Text Tools" active={['text', 'math', 'code'].includes(tool)} expanded={openGroup === 'text'}
                 onClick={() => { const next = openGroup === 'text' ? null : 'text'; setOpenGroup(next); if (next) setTool(lastTextTool, true); }}>
                 {(() => {
                   const active = ['text', 'math', 'code'].includes(tool) ? tool : lastTextTool;
@@ -513,17 +732,19 @@ export default function App() {
                 })()}
               </SideBtn>
               {openGroup === 'text' && (
-                <div className="absolute left-full ml-2 top-0 bg-white p-2 rounded-xl shadow-2xl border border-gray-100 z-[100] flex flex-col gap-1 w-48">
+                <div ref={popoverPanelRef} className="tool-popover tool-popover-list" role="group" aria-label="Text tools" onKeyDown={handlePopoverNavigation}
+                  style={{ left: popoverPosition?.left ?? -9999, top: popoverPosition?.top ?? -9999 }}>
+                  <div className="tool-popover-heading">Text &amp; math</div>
                   {TEXT_TOOLS.map(t => (
-                    <PopoverItem key={t.id} active={['text', 'math', 'code'].includes(tool) ? tool === t.id : lastTextTool === t.id} Icon={t.Icon} label={t.label} onClick={() => { setTool(t.id); }} />
+                    <PopoverItem key={t.id} active={['text', 'math', 'code'].includes(tool) ? tool === t.id : lastTextTool === t.id} Icon={t.Icon} label={t.label} onClick={() => { choosePopoverTool(t.id); }} />
                   ))}
                 </div>
               )}
             </div>
 
             {/* SHAPES GROUP */}
-            <div className="relative group/pop w-full flex justify-center">
-              <SideBtn label="Shapes" active={SHAPE_TOOLS.some(s => s.id === tool)}
+            <div ref={el => { popoverAnchorRefs.current.shapes = el }} className="tool-group">
+              <SideBtn label="Shapes" active={SHAPE_TOOLS.some(s => s.id === tool)} expanded={openGroup === 'shapes'}
                 onClick={() => { const next = openGroup === 'shapes' ? null : 'shapes'; setOpenGroup(next); if (next) setTool(lastShapeTool, true); }}>
                 {(() => {
                   const active = SHAPE_TOOLS.some(s => s.id === tool) ? tool : lastShapeTool;
@@ -532,27 +753,32 @@ export default function App() {
                 })()}
               </SideBtn>
               {openGroup === 'shapes' && (
-                <div className="absolute left-full ml-2 top-0 bg-white p-2 rounded-xl shadow-2xl border border-gray-100 z-[100] w-64">
-                  <div className="grid grid-cols-4 gap-1 mb-2">
-                    {SHAPE_TOOLS.map(t => (
-                      <PopoverItem key={t.id} active={SHAPE_TOOLS.some(s => s.id === tool) ? tool === t.id : lastShapeTool === t.id} Icon={t.Icon} label={t.label} grid onClick={() => { setTool(t.id); }} />
+                <div ref={popoverPanelRef} className="tool-popover tool-popover-shapes" role="group" aria-label="Shape tools" onKeyDown={handlePopoverNavigation}
+                  style={{ left: popoverPosition?.left ?? -9999, top: popoverPosition?.top ?? -9999 }}>
+                  <div className="tool-popover-heading">Basic shapes</div>
+                  <div className="shape-option-grid">
+                    {BASIC_SHAPE_TOOLS.map(t => (
+                      <PopoverItem key={t.id} active={SHAPE_TOOLS.some(s => s.id === tool) ? tool === t.id : lastShapeTool === t.id} Icon={t.Icon} label={t.label} grid onClick={() => { choosePopoverTool(t.id); }} />
                     ))}
                   </div>
-                  <button className="w-full py-2 text-[11px] font-bold text-blue-600 hover:bg-blue-50 rounded-lg border border-blue-100 transition-colors uppercase tracking-wider">
-                    More Shapes
-                  </button>
+                  <div className="tool-popover-heading additional-shapes-heading">Polygons</div>
+                  <div className="shape-option-grid">
+                    {ADDITIONAL_SHAPE_TOOLS.map(t => (
+                      <PopoverItem key={t.id} active={SHAPE_TOOLS.some(s => s.id === tool) ? tool === t.id : lastShapeTool === t.id} Icon={t.Icon} label={t.label} grid onClick={() => { choosePopoverTool(t.id); }} />
+                    ))}
+                  </div>
                 </div>
               )}
             </div>
 
-            <div className="w-7 h-px bg-white/10 my-1.5" />
+            <div className="tool-divider" aria-hidden="true" />
             <SideBtn label="Image (I)" onClick={onImageToolClick}>
               <ImageIcon size={17} />
             </SideBtn>
           </div>
-          <div className="mt-auto flex flex-col items-center gap-0.5 w-full px-2 pb-1">
-            <div className="w-7 h-px bg-white/10 mb-1.5" />
-            <SideBtn label="Colors & Styles" active={panelOpen} onClick={() => setPanelOpen(v => !v)}>
+          <div className="tool-stack tool-stack-bottom">
+            <div className="tool-divider" aria-hidden="true" />
+            <SideBtn label="Colors & Styles" active={panelOpen} expanded={panelOpen} buttonRef={panelTriggerRef} onClick={() => setPanelOpen(v => !v)}>
               <div className="w-5 h-5 rounded-full border-2 border-white/30 overflow-hidden">
                 <div className="w-full h-full rounded-full" style={{ background: penColor }} />
               </div>
@@ -563,179 +789,166 @@ export default function App() {
         </aside>
 
         {/* CANVAS AREA */}
-        <div ref={wrapRef} className="relative flex-1 min-w-0 min-h-0 overflow-hidden"
+        <div ref={wrapRef} className="canvas-workspace relative flex-1 min-w-0 min-h-0 overflow-hidden" style={{ cursor: renderedCursor }}
           onPointerDown={e => {
             const eng = engRef.current; if (!eng) return;
-            // 1. Image tool bypass
+            // Right- and middle-button gestures are camera-only, regardless of the active drawing tool.
+            if (e.button === 2 || e.button === 1) {
+              eng.pointerDown(e.nativeEvent);
+              return;
+            }
+            if (e.button !== 0) return;
             if (tool === 'image') {
               imgPosRef.current = { x: e.clientX, y: e.clientY };
               fileRef.current?.click();
               return;
             }
-            // 2. Intercept DOM scrollbar clicks for sticky notes to allow native scrolling explicitly
             const target = e.target as HTMLElement;
             const sticky = target.closest('[id^="ol_"]');
             if (sticky && (sticky as HTMLElement).scrollHeight > (sticky as HTMLElement).clientHeight) {
               const rect = sticky.getBoundingClientRect();
-              // If click is on the right-hand scrollbar gutter, we let browser handle it (no select/drag)
               if (e.clientX >= rect.right - 20) return;
             }
-            // 3. Normal engine pointer down
             eng.pointerDown(e.nativeEvent);
           }}
-          onPointerMove={e => engRef.current?.pointerMove(e.nativeEvent)}
-          onPointerUp={() => engRef.current?.pointerUp()}
           onDoubleClick={e => engRef.current?.doubleClick(e.nativeEvent)}
-          onContextMenu={e => e.preventDefault()}
+          onContextMenu={e => {
+            const target = e.target as HTMLElement;
+            if (!target.closest('.no-canvas, .formula-editor-panel, .math-tools-panel, .code-editor-shell, .panel-ui')) e.preventDefault();
+          }}
         >
           <canvas
             ref={canvasRef}
-            style={{ cursor, position: 'absolute', inset: 0, width: '100%', height: '100%', display: 'block', touchAction: 'none' }}
+            tabIndex={0}
+            aria-label="Whiteboard canvas. Use the tool rail or keyboard shortcuts to choose tools. Right-drag to pan, scroll to zoom at the pointer, and use arrow keys to pan when no object is selected."
+            style={{ cursor: renderedCursor, position: 'absolute', inset: 0, width: '100%', height: '100%', display: 'block', touchAction: 'none' }}
           />
 
-          {/* Text / sticky edit overlay */}
+          {(!boardReady || boardRestoreError) && (
+            <div role={boardRestoreError ? 'alert' : 'status'} aria-live="polite" style={{ position: 'absolute', inset: 0, zIndex: 2000,
+              display: 'grid', placeItems: 'center', padding: 20, background: 'rgba(248, 248, 245, .96)', pointerEvents: 'auto' }}>
+              {boardRestoreError ? (
+                <div style={{ width: 'min(520px, 100%)', padding: 22, background: '#fff', border: '1px solid #fca5a5', borderRadius: 16,
+                  boxShadow: '0 18px 54px rgba(15,23,42,.18)', color: '#0f172a', font: '14px/1.5 Inter, Segoe UI, sans-serif' }}>
+                  <strong style={{ fontSize: 17 }}>The saved board could not be recovered</strong>
+                  <p style={{ margin: '10px 0', color: '#475569' }}>The canvas is blocked so a blank board cannot replace saved content. Check browser storage, then retry. If you continue without recovery, this tab may not survive a reload.</p>
+                  <p style={{ margin: '0 0 14px', padding: 9, color: '#7f1d1d', background: '#fef2f2', borderRadius: 8, overflowWrap: 'anywhere' }}>{boardRestoreError}</p>
+                  <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+                    <button type="button" onClick={beginBoardInitialization} style={{ padding: '8px 12px', background: '#eff6ff', color: '#1d4ed8', borderRadius: 8, fontWeight: 700 }}>Retry recovery</button>
+                    <button type="button" onClick={() => { continueWithoutLocalRecovery(); setBoardRestoreError(null); setBoardReady(true); }}
+                      style={{ padding: '8px 12px', background: '#b91c1c', color: '#fff', borderRadius: 8, fontWeight: 700 }}>Continue without local recovery</button>
+                  </div>
+                </div>
+              ) : <div style={{ padding: '10px 14px', color: '#334155', background: '#fff', border: '1px solid #e2e8f0', borderRadius: 10,
+                boxShadow: '0 8px 24px rgba(15,23,42,.12)', font: '500 13px/1.4 Inter, Segoe UI, sans-serif' }}>Restoring the local board before opening the canvas…</div>}
+            </div>
+          )}
+
+          {/* Text, sticky-note, and source-code editing overlays */}
           {editShape && editShape.type !== 'math' && (
-            <div style={{
-              position: 'fixed', zIndex: 530,
-              left: editBox.l, top: editBox.t,
-              transform: `scale(${zoom})`,
-              transformOrigin: '0 0'
-            }}>
+            <div className={`no-canvas ${editShape.type === 'code' ? 'code-editor-overlay' : ''}`}
+              style={{ position: 'fixed', zIndex: 530, left: editBox.l, top: editBox.t,
+                transform: `scale(${zoom})`, transformOrigin: '0 0' }}
+              onPointerDown={event => event.stopPropagation()}
+              onDoubleClick={event => event.stopPropagation()}
+              onWheel={event => event.stopPropagation()}
+              onContextMenu={event => event.stopPropagation()}>
               <div className="relative group/editbox" style={{
-                width: editBox.w / zoom, height: editBox.h / zoom,
+                width: editBox.w / zoom,
+                height: editBox.h / zoom,
                 boxSizing: 'border-box',
                 boxShadow: editShape.type === 'sticky' ? '0 12px 48px rgba(0,0,0,0.18)' : editShape.type === 'code' ? '0 12px 64px rgba(0,0,0,0.45)' : 'none',
                 borderRadius: editShape.type === 'sticky' ? 3 : editShape.type === 'code' ? 6 : 4,
                 overflow: 'visible',
-                background: editShape.type === 'sticky' ? (editShape as StickyShape).bg : editShape.type === 'code' ? '#1e1e1e' : 'transparent',
-                border: editShape.type === 'code' ? '1px solid #444' : editShape.type === 'sticky' ? 'none' : 'none',
-                outline: 'none',
-                outlineOffset: '-2px',
+                background: editShape.type === 'sticky' ? (editShape as StickyShape).bg : editShape.type === 'code' ? '#1b2430' : 'transparent',
+                border: 'none',
               }}>
                 <div style={{
-                  position: 'absolute',
-                  inset: -4 / zoom,
+                  position: 'absolute', inset: -4 / zoom,
                   border: `${2.5 / zoom}px solid #3b82f6`,
-                  borderRadius: 3 / zoom,
-                  pointerEvents: 'none',
-                  zIndex: 10
+                  borderRadius: 3 / zoom, pointerEvents: 'none', zIndex: 10,
                 }}>
                   {[-1, 0, 1].map(x => [-1, 0, 1].map(y => {
                     if (x === 0 && y === 0) return null;
-                    const L = x === -1 ? `${-5 / zoom}px` : x === 0 ? `calc(50% - ${5 / zoom}px)` : `calc(100% - ${5 / zoom}px)`;
-                    const T = y === -1 ? `${-5 / zoom}px` : y === 0 ? `calc(50% - ${5 / zoom}px)` : `calc(100% - ${5 / zoom}px)`;
-                    return <div key={`${x}${y}`} style={{ position: 'absolute', left: L, top: T, width: 10 / zoom, height: 10 / zoom, background: '#fff', border: `${1.5 / zoom}px solid #3b82f6`, borderRadius: '50%' }} />;
+                    const left = x === -1 ? `${-5 / zoom}px` : x === 0 ? `calc(50% - ${5 / zoom}px)` : `calc(100% - ${5 / zoom}px)`;
+                    const top = y === -1 ? `${-5 / zoom}px` : y === 0 ? `calc(50% - ${5 / zoom}px)` : `calc(100% - ${5 / zoom}px)`;
+                    return <div key={`${x}${y}`} style={{ position: 'absolute', left, top, width: 10 / zoom, height: 10 / zoom,
+                      background: '#fff', border: `${1.5 / zoom}px solid #3b82f6`, borderRadius: '50%' }} />;
                   }))}
                 </div>
-                <textarea
-                  ref={el => {
-                    if (el && (el as any)._initFocus !== editShape.id) {
-                      (el as any)._initFocus = editShape.id;
-                      el.focus();
-                      
-                      const fs = (editShape as any).fs;
-                      let CHAR_W = fs * 0.6; 
-                      if (editShape.type === 'text' || editShape.type === 'sticky') {
-                        CHAR_W = fs * 0.5; // Approximate width for proportional sans-serif font
-                      }
-                      
-                      const lineH = 1.5 * fs;
-                      const padLeft = editShape.type === 'code' ? (30 + 16) : 16;
-                      const padTop = editShape.type === 'code' ? 12 : 16;
-                      
-                      const dx = (editClick.x - editBox.l) / zoom - padLeft;
-                      const dy = (editClick.y - editBox.t) / zoom - padTop;
-                      
-                      const row = Math.max(0, Math.floor(dy / lineH));
-                      const col = Math.max(0, Math.round(dx / CHAR_W));
-                      
-                      const linesArr = (editText || '').split('\n');
-                      let offset = 0;
-                      for (let i = 0; i < row && i < linesArr.length; i++) {
-                        offset += linesArr[i].length + 1;
-                      }
-                      const targetLine = linesArr[row] || '';
-                      const targetIdx = offset + Math.min(targetLine.length, col);
-                      
-                      setTimeout(() => {
-                         el.setSelectionRange(targetIdx, targetIdx);
-                      }, 0);
-                    }
-                  }}
-                  value={editText}
-                  onChange={e => {
-                    const val = e.target.value;
-                    setEditText(val);
-                    if (engRef.current) {
-                      engRef.current.updateTextLive(editShape.id, val);
-                    }
-                    if (editShape.type !== 'sticky' && engRef.current) {
-                      const s = editShape as any;
-                      const font = editShape.type === 'code' ? `${s.fs}px "'JetBrains Mono',monospace"` : `${s.fs}px "'Inter','Segoe UI',sans-serif"`;
-                      const m = (window as any).measureTextS(val, font, editShape.type === 'code', 1);
 
-                      const paddingW = editShape.type === 'code' ? 62 : 40;
-                      const paddingH = editShape.type === 'code' ? 24 : 40;
-                      const nw = m.w + paddingW;
-                      const nh = m.h + paddingH;
-
-                      setEditBox(prev => ({ ...prev, w: nw * zoom, h: nh * zoom }));
-                      engRef.current.updateSize(editShape.id, nw, nh);
-                    }
-                  }}
-                  onBlur={commitEdit}
-                  onKeyDown={e => {
-                    if (e.key === 'Escape') { e.preventDefault(); commitEdit(); }
-                  }}
-                  style={{
-                    width: editShape.type === 'code' ? `calc(100% - 30px)` : '100%',
-                    height: '100%',
-                    marginLeft: editShape.type === 'code' ? `30px` : 0,
-                    background: 'transparent',
-                    fontSize: (editShape as any).fs,
-                    padding: editShape.type === 'code' ? `12px 16px` : `16px`,
-                    fontFamily: editShape.type === 'code' ? "'JetBrains Mono','Fira Code',monospace" : "'Inter','Segoe UI',sans-serif",
-                    color: editShape.type === 'code' ? '#e2e8f0' : (editShape.type === 'text' ? '#000' : 'rgba(0,0,0,0.8)'),
-                    caretColor: editShape.type === 'code' ? '#fff' : '#3b82f6',
-                    lineHeight: 1.5, boxSizing: 'border-box', resize: 'none',
-                    border: 'none',
-                    borderRadius: 0,
-                    outline: 'none',
-                    display: 'block',
-                    whiteSpace: 'pre-wrap',
-                    wordBreak: 'break-word',
-                    overflowWrap: 'break-word',
-                    overflowX: 'hidden',
-                    overflowY: editShape.type === 'code' || editShape.type === 'sticky' ? 'auto' : 'hidden',
-                  }}
-                />
-
-                {/* Code Highlighter + Line Numbers */}
-                {editShape.type === 'code' && (
-                  <>
-                    <div style={{
-                      position: 'absolute', left: 0, top: 0, bottom: 0, width: 30,
-                      background: '#2d2d2d', borderRight: '1px solid #444',
-                      display: 'flex', flexDirection: 'column', alignItems: 'center',
-                      paddingTop: 12, fontSize: Math.max(9, (editShape as any).fs * 0.8),
-                      fontFamily: "'JetBrains Mono',monospace", color: '#666',
-                      pointerEvents: 'none', userSelect: 'none'
-                    }}>
-                      {(editText || ' ').split('\n').map((_, i) => <div key={i} style={{ lineHeight: 1.8 }}>{i + 1}</div>)}
-                    </div>
-                    <div style={{
-                      position: 'absolute', inset: 0, pointerEvents: 'none',
-                      marginLeft: 30, padding: '12px 16px',
-                      fontSize: (editShape as any).fs,
-                      fontFamily: "'JetBrains Mono',monospace",
-                      lineHeight: 1.5, whiteSpace: 'pre-wrap', overflow: 'hidden',
-                      color: '#e2e8f0',
-                    }}
-                      dangerouslySetInnerHTML={{
-                        __html: `<pre style="margin:0; font-family:inherit;"><code class="language-javascript">${editText ? editText.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string)) : ' '}</code></pre>`
+                {editShape.type === 'code' ? (
+                  <React.Suspense fallback={<div className="code-editor-loading">Loading code editor…</div>}>
+                    <CodeEditor
+                      key={editShape.id}
+                      value={editText}
+                      language={editLanguage}
+                      initialCursor={codeEditorInitialCursor}
+                      fontSize={editShapeFontSize}
+                      autoHeight={editShape.autoHeight !== false}
+                      onChange={value => {
+                        setEditText(value);
+                        engRef.current?.updateCodeLive(editShape.id, value, editLanguage);
                       }}
+                      onLayout={height => engRef.current?.updateCodeLayoutLive(editShape.id, height)}
+                      onAutoHeightChange={(enabled, height) => engRef.current?.setCodeAutoHeight(editShape.id, enabled, height)}
+                      onLanguageChange={language => {
+                        setEditLanguage(language);
+                        engRef.current?.updateCodeLive(editShape.id, editText, language);
+                      }}
+                      onCommit={commitEdit}
                     />
-                  </>
+                  </React.Suspense>
+                ) : (
+                  <textarea
+                    className="board-text-editor"
+                    aria-label={`Edit ${editShape.type} content`}
+                    ref={element => {
+                      if (!element || (element as any)._initFocus === editShape.id) return;
+                      (element as any)._initFocus = editShape.id;
+                      element.focus();
+                      const fs = (editShape as any).fs || 14;
+                      const charWidth = fs * 0.5;
+                      const lineHeight = 1.5 * fs;
+                      const dx = (editClick.x - editBox.l) / zoom - 16;
+                      const dy = (editClick.y - editBox.t) / zoom - 16;
+                      const row = Math.max(0, Math.floor(dy / lineHeight));
+                      const column = Math.max(0, Math.round(dx / charWidth));
+                      const lines = (editText || '').split('\n');
+                      let offset = 0;
+                      for (let index = 0; index < row && index < lines.length; index++) offset += lines[index].length + 1;
+                      const position = offset + Math.min(lines[row]?.length ?? 0, column);
+                      setTimeout(() => element.setSelectionRange(position, position), 0);
+                    }}
+                    value={editText}
+                    onChange={event => {
+                      const value = event.target.value;
+                      setEditText(value);
+                      const engine = engRef.current;
+                      engine?.updateTextLive(editShape.id, value);
+                      if (editShape.type !== 'sticky' && engine) {
+                        const shape = editShape as any;
+                        const measured = (window as any).measureTextS(value, `${shape.fs}px 'Inter','Segoe UI',sans-serif`, false, 1);
+                        const width = measured.w + 40;
+                        const height = measured.h + 40;
+                        setEditBox(previous => ({ ...previous, w: width * zoom, h: height * zoom }));
+                        engine.updateSize(editShape.id, width, height);
+                      }
+                    }}
+                    onBlur={() => commitEdit()}
+                    onKeyDown={event => {
+                      if (event.key === 'Escape') { event.preventDefault(); commitEdit(); }
+                    }}
+                    style={{
+                      width: '100%', height: '100%', background: 'transparent',
+                      fontSize: (editShape as any).fs, padding: 16,
+                      fontFamily: "'Inter','Segoe UI',sans-serif", color: editShape.type === 'text' ? '#000' : 'rgba(0,0,0,0.8)',
+                      caretColor: '#3b82f6', lineHeight: 1.5, boxSizing: 'border-box', resize: 'none',
+                      border: 'none', borderRadius: 0, display: 'block', whiteSpace: 'pre-wrap',
+                      wordBreak: 'break-word', overflowWrap: 'break-word', overflowX: 'hidden',
+                      overflowY: editShape.type === 'sticky' ? 'auto' : 'hidden',
+                    }}
+                  />
                 )}
               </div>
             </div>
@@ -743,100 +956,78 @@ export default function App() {
 
           {/* ── Formula Editor (Math) ── */}
           {editShape && editShape.type === 'math' && (
-            <FormulaEditor
-              initialText={editText}
-              fontSize={(editShape as any).fs || 14}
-              zoom={cam.zoom}
-              worldX={(editShape as any).x}
-              worldY={(editShape as any).y}
-              cam={cam}
-              view={{ w: wrapRef.current?.clientWidth || 0, h: wrapRef.current?.clientHeight || 0 }}
-              onTextChange={setEditText}
-              onCommit={commitEdit}
-              onResize={(nw, nh) => {
-                engRef.current?.updateSize(editShape.id, nw, nh);
-              }}
-              onMove={(nx, ny) => {
-                // nx, ny are NEW WORLD COORDINATES now from FormulaEditor
-                engRef.current?.updatePos(editShape.id, nx, ny);
-              }}
-              clickX={editClick.x !== undefined ? editClick.x - (canvasRef.current?.getBoundingClientRect().left || 0) : undefined}
-              clickY={editClick.y !== undefined ? editClick.y - (canvasRef.current?.getBoundingClientRect().top || 0) : undefined}
-            />
+            <FormulaEditorBoundary key={editShape.id} sourceRef={editTextRef} getLastValidPreview={getLastValidFormulaPreview}
+              onSourceChange={handleFormulaSourceChange} onCommit={commitEdit}>
+              <FormulaEditor
+                key={editShape.id}
+                initialText={editText}
+                initialPreviewText={(editShape as any).previewText ?? editText}
+                fontSize={formulaFontSize}
+                zoom={cam.zoom}
+                worldX={(editShape as any).x}
+                worldY={(editShape as any).y}
+                cam={cam}
+                view={{ w: wrapRef.current?.clientWidth || 0, h: wrapRef.current?.clientHeight || 0 }}
+                onTextChange={handleFormulaSourceChange}
+                onCommit={commitEdit}
+                onResize={resizeFormula}
+                onMove={moveFormula}
+                clickX={editClick.x !== undefined ? editClick.x - (canvasRef.current?.getBoundingClientRect().left || 0) : undefined}
+                clickY={editClick.y !== undefined ? editClick.y - (canvasRef.current?.getBoundingClientRect().top || 0) : undefined}
+              />
+            </FormulaEditorBoundary>
           )}
 
           {/* Math Tools Panel handled inside FormulaEditor */}
 
           {/* Floating selection toolbar */}
           {selIds.length > 0 && !editShape && (tool === 'select' || tool === 'lasso-select') && (
-            <div className="absolute top-4 left-1/2 -translate-x-1/2 z-40 flex items-center gap-1
-                            bg-white rounded-2xl shadow-[0_4px_32px_rgba(0,0,0,.14)]
-                            px-3 py-1.5 border border-gray-100/80 backdrop-blur-sm">
-              <span className="text-[11px] text-gray-400 font-medium pr-2 border-r border-gray-100">{selIds.length} selected</span>
+            <div className="selection-toolbar toolbar no-canvas absolute top-4 left-1/2 -translate-x-1/2 z-40 flex items-center gap-1
+                            bg-white rounded-xl shadow-md px-3 py-1.5 border border-gray-200">
+              <span className="text-[11px] text-gray-600 font-medium pr-2 border-r border-gray-200">{selIds.length} selected</span>
               <button onClick={() => engRef.current?.dupSel()}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] font-medium rounded-xl hover:bg-gray-50 text-gray-600 transition-colors">
-                <Copy size={12} /> Duplicate
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] font-medium rounded-lg hover:bg-gray-50 text-gray-700 transition-colors">
+                <Copy size={13} /> Duplicate
               </button>
               <button onClick={() => { const ids = [...engRef.current!.sel]; engRef.current?.updateStyle(ids, { fill, stroke, sw }); }}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] font-medium rounded-xl hover:bg-gray-50 text-gray-600 transition-colors">
-                <Palette size={12} /> Style
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] font-medium rounded-lg hover:bg-gray-50 text-gray-700 transition-colors">
+                <Palette size={13} /> Style
               </button>
-              <div className="w-px h-4 bg-gray-100" />
+              <div className="w-px h-4 bg-gray-200" />
               <button onClick={() => engRef.current?.deleteSel()}
-                className="flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] font-medium rounded-xl hover:bg-red-50 text-red-500 transition-colors">
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] font-medium rounded-lg hover:bg-red-50 text-red-600 transition-colors">
                 <Trash2 size={12} /> Delete
               </button>
             </div>
           )}
 
-          {/* Zoom controls */}
-          <div className="zoom-controls absolute bottom-6 right-6 z-40 flex items-center bg-white rounded-2xl shadow-[0_4px_24px_rgba(0,0,0,.12)] border border-gray-100 overflow-hidden">
-            <button onClick={resetZoom} title="Reset 100%" className="w-9 h-9 flex items-center justify-center hover:bg-gray-50 text-gray-500 transition-colors border-r border-gray-100"><Maximize2 size={13} /></button>
-            <button onClick={() => zoomBy(-0.2)} title="Zoom out" className="w-9 h-9 flex items-center justify-center hover:bg-gray-50 text-gray-600 transition-colors"><ZoomOut size={14} /></button>
-            <button onClick={resetZoom} className="h-9 px-2 min-w-[52px] text-[12px] font-bold text-gray-700 hover:bg-gray-50 transition-colors tabular-nums">{Math.round(zoom * 100)}%</button>
-            <button onClick={() => zoomBy(0.2)} title="Zoom in" className="w-9 h-9 flex items-center justify-center hover:bg-gray-50 text-gray-600 transition-colors border-l border-gray-100"><ZoomIn size={14} /></button>
-          </div>
+          {/* Canvas HUD: responsive groups keep controls from overlapping the board edge. */}
+          <div className="canvas-hud no-canvas">
+            <div className="hud-utility-cluster">
+              {[["Timer", Timer], ["Video", Video], ["Comments", MessageSquare], ["More", MoreHorizontal]].map(([label, Icon]: any) => (
+                <button key={label} type="button" disabled title={`${label} is not available yet`} aria-label={`${label} (not available yet)`}
+                  className="hud-tool-button flex items-center justify-center rounded-md text-gray-500 disabled:cursor-not-allowed">
+                  <Icon size={16} strokeWidth={2} />
+                </button>
+              ))}
+            </div>
 
-          {/* Draggable Scrollbars */}
-          <div className="absolute right-1 top-1/2 -translate-y-1/2 w-[10px] h-[100px] bg-gray-400/20 hover:bg-gray-400/40 rounded-full z-40 cursor-n-resize transition-colors"
-            onMouseDown={(e) => {
-              e.stopPropagation();
-              const startY = e.clientY;
-              const startCamY = engRef.current?.cam.y || 0;
-              const h = (m: MouseEvent) => {
-                const dy = m.clientY - startY;
-                engRef.current?.setCamera(engRef.current.cam.x, startCamY + dy * 2, engRef.current.cam.zoom);
-              };
-              const u = () => { window.removeEventListener('mousemove', h); window.removeEventListener('mouseup', u); };
-              window.addEventListener('mousemove', h); window.addEventListener('mouseup', u);
-            }}
-          />
-          <div className="absolute bottom-1 left-1/2 -translate-x-1/2 h-[10px] w-[100px] bg-gray-400/20 hover:bg-gray-400/40 rounded-full z-40 cursor-e-resize transition-colors"
-            onMouseDown={(e) => {
-              e.stopPropagation();
-              const startX = e.clientX;
-              const startCamX = engRef.current?.cam.x || 0;
-              const h = (m: MouseEvent) => {
-                const dx = m.clientX - startX;
-                engRef.current?.setCamera(startCamX + dx * 2, engRef.current.cam.y, engRef.current.cam.zoom);
-              };
-              const u = () => { window.removeEventListener('mousemove', h); window.removeEventListener('mouseup', u); };
-              window.addEventListener('mousemove', h); window.addEventListener('mouseup', u);
-            }}
-          />
+            <div className="canvas-hud-hint" aria-label="Canvas controls: right-drag to pan; scroll to zoom at the pointer; double-click a text-like object to edit">
+              <span>Right-drag to pan</span><span className="hud-hint-divider" aria-hidden="true" />
+              <span>Scroll to zoom at pointer</span><span className="hud-hint-divider" aria-hidden="true" />
+              <span>Double-click text-like object to edit</span>
+            </div>
 
-          {/* Minimized bottom-left tools */}
-          <div className="absolute bottom-6 left-4 z-40 flex items-center gap-2 bg-white/90 backdrop-blur-md px-2 py-1.5 rounded-full shadow-[0_2px_16px_rgba(0,0,0,.09)] border border-gray-100/80">
-            {[['Timer', Timer], ['Video', Video], ['Comments', MessageSquare], ['More', MoreHorizontal]].map(([l, I]: any) => (
-              <button key={l} title={l} className="w-8 h-8 flex items-center justify-center rounded-full text-gray-500 hover:text-gray-900 hover:bg-gray-100 transition-all">
-                <I size={16} strokeWidth={2} />
-              </button>
-            ))}
-          </div>
-
-          {/* Hint bar */}
-          <div className="absolute bottom-6 left-1/2 -translate-x-1/2 z-40 flex items-center gap-3 text-[11px] text-gray-400 bg-white/80 backdrop-blur-md px-4 py-1.5 rounded-full shadow-[0_2px_12px_rgba(0,0,0,.07)] border border-gray-100/60 whitespace-nowrap">
-            <span>Scroll = pan</span><span className="w-px h-3 bg-gray-200" /><span>Ctrl+Scroll = zoom</span><span className="w-px h-3 bg-gray-200" /><span>Dbl-click = sticky</span>
+            <div className="zoom-controls flex items-center bg-white rounded-lg border border-gray-200 overflow-hidden">
+              <button type="button" onClick={resetZoom} title="Reset zoom to 100%" aria-label="Reset zoom to 100 percent"
+                className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-600 transition-colors border-r border-gray-200"><Maximize2 size={14} /></button>
+              <button type="button" onClick={() => zoomBy(-0.2)} title="Zoom out" aria-label="Zoom out"
+                className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-700 transition-colors"><ZoomOut size={15} /></button>
+              <button type="button" onClick={resetZoom} aria-label={`Zoom level ${Math.round(zoom * 100)} percent; reset zoom`}
+                className="zoom-percent-button h-9 px-2 min-w-[52px] text-[12px] font-semibold text-gray-800 hover:bg-gray-50 transition-colors tabular-nums">{Math.round(zoom * 100)}%</button>
+              <button type="button" onClick={() => zoomBy(0.2)} title="Zoom in" aria-label="Zoom in"
+                className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-700 transition-colors border-l border-gray-200"><ZoomIn size={15} /></button>
+            </div>
           </div>
         </div>
       </div>
@@ -844,14 +1035,19 @@ export default function App() {
       {/* ══ COLOR PANEL ══════════════════════════════════════════════════════ */}
       {panelOpen && (
         <>
-          <div className="fixed inset-0 z-[998]" onClick={() => setPanelOpen(false)} />
-          <div className="panel-ui fixed left-[68px] z-[999] bg-white rounded-2xl border border-gray-100 overflow-hidden"
-            style={{ top: '50%', transform: 'translateY(-50%)', width: 284, maxHeight: '82vh', boxShadow: '0 12px 60px rgba(0,0,0,.22)' }}>
-            <div className="sticky top-0 bg-white z-10 flex items-center justify-between px-4 py-3 border-b border-gray-50">
-              <div className="flex items-center gap-2"><Palette size={14} className="text-gray-400" /><span className="text-[13px] font-semibold text-gray-800">Colors & Styles</span></div>
-              <button onClick={() => setPanelOpen(false)} className="w-6 h-6 flex items-center justify-center rounded-md text-gray-300 hover:text-gray-600 hover:bg-gray-100"><X size={13} /></button>
+          <div className="panel-backdrop fixed inset-0 z-[998]" aria-hidden="true" onClick={() => closeStylePanel(true)} />
+          <div ref={panelRef} className="panel-ui fixed z-[999] rounded-xl border overflow-hidden flex flex-col"
+            role="dialog" aria-label="Colors and styles" aria-modal="true"
+            onKeyDown={handleStylePanelKeyDown}
+            style={{
+              top: '50%', left: 'clamp(8px, calc(100vw - 296px), 68px)', transform: 'translateY(-50%)',
+              width: 'min(284px, calc(100vw - 16px))', maxHeight: 'calc(100dvh - 16px)'
+            }}>
+            <div className="panel-heading sticky top-0 z-10 flex items-center justify-between px-4 py-3 border-b shrink-0">
+              <div className="panel-title-group flex items-center gap-2"><Palette size={16} aria-hidden="true" /><span>Colors &amp; styles</span></div>
+              <button type="button" onClick={() => closeStylePanel(true)} aria-label="Close Colors & Styles" className="panel-close-button"><X size={16} /></button>
             </div>
-            <div className="p-4 space-y-5">
+            <div className="panel-content">
               {/* Pen */}
               <section>
                 <div className="flex items-center justify-between mb-2">
@@ -860,11 +1056,11 @@ export default function App() {
                 </div>
                 <div className="flex gap-1 flex-wrap mb-2">
                   {PALETTE.map(c => (
-                    <button key={c} onClick={() => setPenColor(c)} className={`w-6 h-6 rounded border flex items-center justify-center ${penColor === c ? 'border-blue-500' : 'border-transparent'}`} style={{ background: c }}>{penColor === c && <Check size={10} color="#fff" />}</button>
+                    <button key={c} type="button" onClick={() => setPenColor(c)} aria-label={`Pen color ${c}`} aria-pressed={penColor === c} className={`color-swatch w-6 h-6 rounded border flex items-center justify-center ${penColor === c ? 'border-blue-500' : 'border-transparent'}`} style={{ background: c }}>{penColor === c && <Check size={10} color={['#f9a8d4', '#f97316'].includes(c) ? '#192536' : '#fff'} />}</button>
                   ))}
                   <div className="relative">
-                    <input type="color" value={penColor} onChange={e => setPenColor(e.target.value)} className="w-6 h-6 opacity-0 absolute inset-0 cursor-pointer" />
-                    <button className="w-6 h-6 rounded border border-gray-300 flex items-center justify-center bg-transparent"><Palette size={12} color="#999" /></button>
+                    <input type="color" value={penColor} onChange={e => setPenColor(e.target.value)} aria-label="Choose custom pen color" className="color-picker-input w-6 h-6 opacity-0 absolute inset-0 cursor-pointer" />
+                    <button type="button" tabIndex={-1} aria-hidden="true" className="w-6 h-6 rounded border border-gray-300 flex items-center justify-center bg-transparent"><Palette size={12} color="#999" /></button>
                   </div>
                 </div>
               </section>
@@ -875,7 +1071,7 @@ export default function App() {
                   <span className="text-[10px] font-bold uppercase tracking-widest text-gray-400">Pen Size</span>
                   <span className="text-[11px] text-gray-400">{penSize}px</span>
                 </div>
-                <input type="range" min={1} max={50} value={penSize} onChange={e => setPenSize(+e.target.value)} className="w-full h-1.5 accent-blue-500" />
+                <input type="range" min={1} max={50} value={penSize} aria-label="Pen size" onChange={e => setPenSize(+e.target.value)} className="w-full h-1.5 accent-blue-500" />
               </section>
 
               {/* Font size */}
@@ -884,7 +1080,7 @@ export default function App() {
                   <span className="text-[10px] font-bold uppercase tracking-widest text-gray-400">Font Size</span>
                   <span className="text-[11px] text-gray-400">{fontSize}px</span>
                 </div>
-                <input type="range" min={10} max={48} value={fontSize} onChange={e => setFontSize(+e.target.value)} className="w-full accent-blue-500 h-1.5" />
+                <input type="range" min={10} max={48} value={fontSize} aria-label="Font size" onChange={e => setFontSize(+e.target.value)} className="w-full accent-blue-500 h-1.5" />
               </section>
 
               <hr className="border-gray-100" />
@@ -897,12 +1093,12 @@ export default function App() {
                 </div>
                 <div className="flex gap-1 flex-wrap mb-2">
                   {PALETTE.map((c, i) => (
-                    <button key={i} onClick={() => setFill(c)} className={`w-6 h-6 rounded border flex items-center justify-center ${fill === c ? 'border-blue-500' : 'border-transparent'}`} style={{ background: c }}>{fill === c && <Check size={10} color={c === '#ffffff' ? '#000' : '#fff'} />}</button>
+                    <button key={i} type="button" onClick={() => setFill(c)} aria-label={`Shape fill ${c}`} aria-pressed={fill === c} className={`color-swatch w-6 h-6 rounded border flex items-center justify-center ${fill === c ? 'border-blue-500' : 'border-transparent'}`} style={{ background: c }}>{fill === c && <Check size={10} color={['#ffffff', '#f9a8d4', '#f97316'].includes(c) ? '#192536' : '#fff'} />}</button>
                   ))}
-                  <button onClick={() => setFill('transparent')} className={`w-6 h-6 rounded border border-dashed border-gray-300 flex items-center justify-center ${fill === 'transparent' ? 'border-blue-500 bg-gray-100' : 'bg-transparent'}`} title="Transparent"><X size={12} color="#999" /></button>
+                  <button type="button" onClick={() => setFill('transparent')} aria-label="Transparent shape fill" aria-pressed={fill === 'transparent'} className={`color-swatch w-6 h-6 rounded border border-dashed border-gray-300 flex items-center justify-center ${fill === 'transparent' ? 'border-blue-500 bg-gray-100' : 'bg-transparent'}`} title="Transparent"><X size={12} color="#999" /></button>
                   <div className="relative">
-                    <input type="color" value={fill === 'transparent' ? '#ffffff' : fill} onChange={e => setFill(e.target.value)} className="w-6 h-6 opacity-0 absolute inset-0 cursor-pointer" />
-                    <button className="w-6 h-6 rounded border border-gray-300 flex items-center justify-center bg-transparent"><Palette size={12} color="#999" /></button>
+                    <input type="color" value={fill === 'transparent' ? '#ffffff' : fill} onChange={e => setFill(e.target.value)} aria-label="Choose custom shape fill" className="color-picker-input w-6 h-6 opacity-0 absolute inset-0 cursor-pointer" />
+                    <button type="button" tabIndex={-1} aria-hidden="true" className="w-6 h-6 rounded border border-gray-300 flex items-center justify-center bg-transparent"><Palette size={12} color="#999" /></button>
                   </div>
                 </div>
               </section>
@@ -915,19 +1111,19 @@ export default function App() {
                 </div>
                 <div className="flex gap-1 flex-wrap mb-2">
                   {PALETTE.map((c, i) => (
-                    <button key={i} onClick={() => setStroke(c)} className={`w-6 h-6 rounded border flex items-center justify-center ${stroke === c ? 'border-blue-500' : 'border-transparent'}`} style={{ background: c }}>{stroke === c && <Check size={10} color={c === '#ffffff' ? '#000' : '#fff'} />}</button>
+                    <button key={i} type="button" onClick={() => setStroke(c)} aria-label={`Stroke color ${c}`} aria-pressed={stroke === c} className={`color-swatch w-6 h-6 rounded border flex items-center justify-center ${stroke === c ? 'border-blue-500' : 'border-transparent'}`} style={{ background: c }}>{stroke === c && <Check size={10} color={['#ffffff', '#f9a8d4', '#f97316'].includes(c) ? '#192536' : '#fff'} />}</button>
                   ))}
-                  <button onClick={() => setStroke('transparent')} className={`w-6 h-6 rounded border border-dashed border-gray-300 flex items-center justify-center ${stroke === 'transparent' ? 'border-blue-500 bg-gray-100' : 'bg-transparent'}`} title="Transparent"><X size={12} color="#999" /></button>
+                  <button type="button" onClick={() => setStroke('transparent')} aria-label="Transparent stroke" aria-pressed={stroke === 'transparent'} className={`color-swatch w-6 h-6 rounded border border-dashed border-gray-300 flex items-center justify-center ${stroke === 'transparent' ? 'border-blue-500 bg-gray-100' : 'bg-transparent'}`} title="Transparent"><X size={12} color="#999" /></button>
                   <div className="relative">
-                    <input type="color" value={stroke === 'transparent' ? '#ffffff' : stroke} onChange={e => setStroke(e.target.value)} className="w-6 h-6 opacity-0 absolute inset-0 cursor-pointer" />
-                    <button className="w-6 h-6 rounded border border-gray-300 flex items-center justify-center bg-transparent"><Palette size={12} color="#999" /></button>
+                    <input type="color" value={stroke === 'transparent' ? '#ffffff' : stroke} onChange={e => setStroke(e.target.value)} aria-label="Choose custom stroke color" className="color-picker-input w-6 h-6 opacity-0 absolute inset-0 cursor-pointer" />
+                    <button type="button" tabIndex={-1} aria-hidden="true" className="w-6 h-6 rounded border border-gray-300 flex items-center justify-center bg-transparent"><Palette size={12} color="#999" /></button>
                   </div>
                 </div>
                 <div className="flex justify-between mb-2 mt-4">
                   <span className="text-[10px] font-bold uppercase tracking-widest text-gray-400">Stroke Width</span>
                   <span className="text-[11px] text-gray-400">{sw}px</span>
                 </div>
-                <input type="range" min={0} max={50} value={sw} onChange={e => setSw(+e.target.value)} className="w-full h-1.5 accent-blue-500" />
+                <input type="range" min={0} max={50} value={sw} aria-label="Stroke width" onChange={e => setSw(+e.target.value)} className="w-full h-1.5 accent-blue-500" />
               </section>
 
               <hr className="border-gray-100" />
@@ -940,8 +1136,8 @@ export default function App() {
                 </div>
                 <div className="flex gap-1 flex-wrap mb-2">
                   {STICKY_COLORS.map(c => (
-                    <button key={c} onClick={() => setStickyBg(c)}
-                      className={['w-6 h-6 rounded border flex items-center justify-center transition-all', stickyBg === c ? 'border-blue-500 scale-110' : 'border-transparent'].join(' ')}
+                    <button key={c} type="button" onClick={() => setStickyBg(c)} aria-label={`Sticky color ${c}`} aria-pressed={stickyBg === c}
+                      className={['sticky-swatch w-6 h-6 rounded border flex items-center justify-center transition-all', stickyBg === c ? 'border-blue-500 scale-110' : 'border-transparent'].join(' ')}
                       style={{ background: c }}>
                       {stickyBg === c && <Check size={10} color="#000" />}
                     </button>
@@ -953,8 +1149,8 @@ export default function App() {
         </>
       )}
 
+      <BoardStatusBanner />
       <input ref={fileRef} type="file" accept="image/*" className="hidden" onChange={onImageFile} />
     </div>
   );
 }
-

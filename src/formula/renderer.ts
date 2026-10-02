@@ -1,202 +1,72 @@
-// ─── Formula DOM Renderer v2 ─── Box-model layout engine tương đương Word ───
-// Sử dụng relative positioning, proper baseline, scaled operators
+// KaTeX-backed renderer shared by palette previews, the formula editor, and static canvas objects.
+import katex from 'katex';
+import 'katex/dist/katex.min.css';
 import type { FormulaNode } from './types';
-import { MATH_SCALES as S } from './types';
+import { serializeToLatex } from './ast';
 
-// ─── Constants ──────────────────────────────────────────────────────────────
-const MATH_FONT = "'Cambria Math','Times New Roman','STIX Two Math','Latin Modern Math',serif";
+const MAX_FONT_SIZE = 180;
 
-// Cache cho các node đã render (memoization)
-const renderCache = new WeakMap<FormulaNode, string>();
+export interface FormulaRenderOptions {
+  /** Apply real TeX display style without changing the expression or its math layout. */
+  mathStyle?: 'text' | 'display';
+}
 
-// ─── Utility: check nếu row chỉ có 1 placeholder (empty slot) ─────────────
-function isEmptyRow(node: FormulaNode | undefined): boolean {
-  if (!node) return true;
-  if (node.type === 'placeholder') return true;
-  if (node.type === 'row') {
-    const ch = node.children || [];
-    return ch.length === 0 || (ch.length === 1 && ch[0].meta?.isPlaceholder === true);
+function presentEditableSlots(node: FormulaNode): FormulaNode {
+  if (node.type === 'placeholder') {
+    // Keep the source placeholder editable, but display it as KaTeX's real outlined square glyph.
+    return { ...node, type: 'symbol', value: '\\square', children: undefined, meta: { ...node.meta, isPlaceholder: false } };
   }
-  return false;
+  return { ...node, children: node.children?.map(presentEditableSlots) };
 }
 
-interface RenderOptions {
-  isStatic?: boolean;
-}
+function renderLatex(latexSource: string, fontSize: number, staticDisplay: boolean, options: FormulaRenderOptions = {}): string {
+  const safeSize = Math.max(8, Math.min(MAX_FONT_SIZE, Number.isFinite(fontSize) ? fontSize : 18));
+  const rawLatex = latexSource || '\\,';
+  const latex = options.mathStyle === 'display' ? `\\displaystyle ${rawLatex}` : rawLatex;
+  const fallback = () => {
+    const escaped = rawLatex.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    return `<span class="fm-render-error" role="status" aria-label="Formula could not be rendered; showing safe source fallback" style="display:inline-block;font-family:ui-monospace,monospace;font-size:${safeSize}px;line-height:1.35;color:#b42318;background:#fff4f2;border:1px solid #f1b4ac;border-radius:4px;padding:4px 7px;white-space:pre-wrap">Formula could not be rendered: ${escaped}</span>`;
+  };
 
-/** Render FormulaNode → HTML string (cho edit preview) */
-export function renderFormulaToHTML(node: FormulaNode, fontSize: number = 18): string {
-  return `<div class="fm" style="font-size:${fontSize}px;font-family:${MATH_FONT};line-height:1.2;display:inline-flex;align-items:center;color:#1a1a1a">${renderNode(node, fontSize, { isStatic: false })}</div>`;
-}
-
-/** Render for canvas overlay (static display, no interactivity) */
-export function renderFormulaStatic(node: FormulaNode, fontSize: number = 14): string {
-  return `<div class="fm" style="font-size:${fontSize}px;font-family:${MATH_FONT};line-height:1.2;display:inline-flex;align-items:center;user-select:none;color:#1a1a1a">${renderNode(node, fontSize, { isStatic: true })}</div>`;
-}
-
-// ─── Core render function ───────────────────────────────────────────────────
-function renderNode(node: FormulaNode, fs: number, opts: RenderOptions = {}): string {
-  const cached = renderCache.get(node);
-  if (cached) return cached;
-
-  let html = '';
-
-  switch (node.type) {
-    // ━━━ Atomic nodes ━━━
-    case 'symbol':
-      if (node.value === ' ') {
-        html = `<span class="fm-sym" data-id="${node.id}" style="white-space:pre-wrap">&nbsp;</span>`;
-      } else {
-        html = `<span class="fm-sym" data-id="${node.id}" style="font-style:italic;padding:0 0.05em">${esc(node.value || '')}</span>`;
-      }
-      break;
-
-    case 'operator':
-      html = `<span class="fm-op" data-id="${node.id}" style="padding:0 0.2em;font-style:normal">${esc(node.value || '')}</span>`;
-      break;
-
-    case 'number':
-      html = `<span class="fm-num" data-id="${node.id}" style="font-style:normal;padding:0 0.03em">${esc(node.value || '')}</span>`;
-      break;
-
-    case 'text':
-      html = `<span class="fm-txt" data-id="${node.id}" style="font-style:normal;font-family:'Inter','Segoe UI',sans-serif">${esc(node.value || '')}</span>`;
-      break;
-
-    // ━━━ Placeholder ━━━
-    case 'placeholder':
-      html = `<span class="fm-ph ${opts.isStatic ? 'fm-ph-ghost' : ''}" data-id="${node.id}"></span>`;
-      break;
-
-    // ━━━ Row (basic container) ━━━
-    case 'row':
-      html = `<span class="fm-row" data-id="${node.id}">${(node.children || []).map(c => renderNode(c, fs, opts)).join('')}</span>`;
-      break;
-
-    // ━━━ Fraction ━━━ numerator / denominator with bar
-    case 'fraction': {
-      const [numer, denom] = node.children || [];
-      const subFs = fs * S.FRAC_NUMERATOR;
-      html = `<span class="fm-frac" data-id="${node.id}"><span class="fm-frac-n">${renderNode(numer, subFs, opts)}</span><span class="fm-frac-bar"></span><span class="fm-frac-d">${renderNode(denom, subFs, opts)}</span></span>`;
-      break;
-    }
-
-    // ━━━ Square root / Nth root ━━━
-    case 'root': {
-      const [body, degree] = node.children || [];
-      const degH = degree ? `<span class="fm-root-deg">${renderNode(degree, fs * S.ROOT_DEGREE, opts)}</span>` : '';
-      html = `<span class="fm-root" data-id="${node.id}">${degH}<span class="fm-root-surd">√</span><span class="fm-root-body">${renderNode(body, fs, opts)}</span></span>`;
-      break;
-    }
-
-    // ━━━ Superscript ━━━
-    case 'sup': {
-      const [base, sup] = node.children || [];
-      html = `<span class="fm-script" data-id="${node.id}"><span class="fm-base">${renderNode(base, fs, opts)}</span><span class="fm-sup">${renderNode(sup, fs * S.SUP_SUB, opts)}</span></span>`;
-      break;
-    }
-
-    // ━━━ Subscript ━━━
-    case 'sub': {
-      const [base, sub] = node.children || [];
-      html = `<span class="fm-script" data-id="${node.id}"><span class="fm-base">${renderNode(base, fs, opts)}</span><span class="fm-sub">${renderNode(sub, fs * S.SUP_SUB, opts)}</span></span>`;
-      break;
-    }
-
-    // ━━━ Superscript + Subscript ━━━
-    case 'supsub': {
-      const [base, sup, sub] = node.children || [];
-      html = `<span class="fm-script" data-id="${node.id}"><span class="fm-base">${renderNode(base, fs, opts)}</span><span class="fm-supsub-col"><span class="fm-sup">${renderNode(sup, fs * S.SUP_SUB, opts)}</span><span class="fm-sub">${renderNode(sub, fs * S.SUP_SUB, opts)}</span></span></span>`;
-      break;
-    }
-
-    // ━━━ Integral ∫ ━━━
-    case 'integral': {
-      const [lower, upper, body] = node.children || [];
-      const opFs = fs * S.INTEGRAL;
-      const bndFs = fs * S.BOUNDS;
-      const showUpper = !isEmptyRow(upper);
-      const showLower = !isEmptyRow(lower);
-      html = `<span class="fm-bigop" data-id="${node.id}"><span class="fm-bigop-core"><span class="fm-bigop-upper" style="${showUpper ? '' : 'display:none'}">${renderNode(upper, bndFs, opts)}</span><span class="fm-bigop-sym" style="font-size:${opFs}px">∫</span><span class="fm-bigop-lower" style="${showLower ? '' : 'display:none'}">${renderNode(lower, bndFs, opts)}</span></span><span class="fm-bigop-body">${renderNode(body, fs, opts)}</span></span>`;
-      break;
-    }
-
-    // ━━━ Summation ∑ ━━━
-    case 'sum': {
-      const [lower, upper, body] = node.children || [];
-      const opFs = fs * S.SUM_PRODUCT;
-      const bndFs = fs * S.BOUNDS;
-      const showUpper = !isEmptyRow(upper);
-      const showLower = !isEmptyRow(lower);
-      html = `<span class="fm-bigop" data-id="${node.id}"><span class="fm-bigop-core"><span class="fm-bigop-upper" style="${showUpper ? '' : 'display:none'}">${renderNode(upper, bndFs, opts)}</span><span class="fm-bigop-sym" style="font-size:${opFs}px">∑</span><span class="fm-bigop-lower" style="${showLower ? '' : 'display:none'}">${renderNode(lower, bndFs, opts)}</span></span><span class="fm-bigop-body">${renderNode(body, fs, opts)}</span></span>`;
-      break;
-    }
-
-    // ━━━ Product ∏ ━━━
-    case 'product': {
-      const [lower, upper, body] = node.children || [];
-      const opFs = fs * S.SUM_PRODUCT;
-      const bndFs = fs * S.BOUNDS;
-      const showUpper = !isEmptyRow(upper);
-      const showLower = !isEmptyRow(lower);
-      html = `<span class="fm-bigop" data-id="${node.id}"><span class="fm-bigop-core"><span class="fm-bigop-upper" style="${showUpper ? '' : 'display:none'}">${renderNode(upper, bndFs, opts)}</span><span class="fm-bigop-sym" style="font-size:${opFs}px">∏</span><span class="fm-bigop-lower" style="${showLower ? '' : 'display:none'}">${renderNode(lower, bndFs, opts)}</span></span><span class="fm-bigop-body">${renderNode(body, fs, opts)}</span></span>`;
-      break;
-    }
-
-    // ━━━ Limit ━━━
-    case 'limit': {
-      const [variable, body] = node.children || [];
-      const lowerFs = fs * S.LIMIT_LOWER;
-      html = `<span class="fm-lim" data-id="${node.id}"><span class="fm-lim-core"><span class="fm-lim-op">lim</span><span class="fm-lim-lower">${renderNode(variable, lowerFs, opts)}</span></span><span class="fm-lim-body">${renderNode(body, fs, opts)}</span></span>`;
-      break;
-    }
-
-    // ━━━ Delimiters ━━━
-    case 'parens': {
-      const inner = (node.children || [])[0];
-      html = `<span class="fm-delim" data-id="${node.id}"><span class="fm-delim-l">(</span><span class="fm-delim-inner">${renderNode(inner, fs, opts)}</span><span class="fm-delim-r">)</span></span>`;
-      break;
-    }
-    case 'brackets': {
-      const inner = (node.children || [])[0];
-      html = `<span class="fm-delim" data-id="${node.id}"><span class="fm-delim-l">[</span><span class="fm-delim-inner">${renderNode(inner, fs, opts)}</span><span class="fm-delim-r">]</span></span>`;
-      break;
-    }
-    case 'braces': {
-      const inner = (node.children || [])[0];
-      html = `<span class="fm-delim" data-id="${node.id}"><span class="fm-delim-l">{</span><span class="fm-delim-inner">${renderNode(inner, fs, opts)}</span><span class="fm-delim-r">}</span></span>`;
-      break;
-    }
-
-    // ━━━ Matrix ━━━
-    case 'matrix': {
-      const [rows, cols] = (node.value || '2x2').split('x').map(Number);
-      const cells = node.children || [];
-      let grid = '';
-      for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-          const cell = cells[r * cols + c];
-          grid += `<span class="fm-matrix-cell">${cell ? renderNode(cell, fs * 0.9, opts) : ''}</span>`;
-        }
-      }
-      html = `<span class="fm-matrix" data-id="${node.id}"><span class="fm-delim-l" style="font-size:1.6em">(</span><span class="fm-matrix-grid" style="grid-template-columns:repeat(${cols},auto)">${grid}</span><span class="fm-delim-r" style="font-size:1.6em">)</span></span>`;
-      break;
-    }
-
-    default:
-      html = `<span data-id="${node.id}">${esc(node.value || '')}</span>`;
+  try {
+    const rendered = katex.renderToString(latex, {
+      displayMode: false,
+      throwOnError: true,
+      strict: 'ignore',
+      output: 'htmlAndMathml',
+      maxExpand: 1000,
+      maxSize: 300,
+      errorColor: '#c2413b',
+    });
+    if (rendered.includes('katex-error')) return fallback();
+    const staticClass = staticDisplay ? ' math-render-static' : ' math-render-edit-preview';
+    return `<span class="math-render-root${staticClass}" style="display:inline-block;font-size:${safeSize}px;line-height:1.25;color:inherit;${staticDisplay ? 'user-select:none;' : ''}">${rendered}</span>`;
+  } catch {
+    // Preview failure is local; the original editor source remains authoritative and unchanged.
+    return fallback();
   }
-
-  renderCache.set(node, html);
-  return html;
 }
 
-/** Clear render cache */
-export function clearRenderCache() {
-  // WeakMap auto-cleans when nodes are GC'd
+/** Render an AST for viewing. Editable template slots use KaTeX's supported square symbol without mutating source. */
+export function renderFormulaToHTML(node: FormulaNode, fontSize = 18, options: FormulaRenderOptions = {}): string {
+  const previewNode = presentEditableSlots(node);
+  return renderLatex(serializeToLatex(previewNode), fontSize, false, options);
 }
 
-// HTML escaping
-function esc(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+/** Render a trusted, source-level TeX preview through the same bundled KaTeX configuration. */
+export function renderLatexToHTML(latex: string, fontSize = 18, options: FormulaRenderOptions = {}): string {
+  return renderLatex(latex, fontSize, false, options);
+}
+
+export function renderFormulaStatic(node: FormulaNode, fontSize = 14): string {
+  const previewNode = presentEditableSlots(node);
+  return renderLatex(serializeToLatex(previewNode), fontSize, true);
+}
+
+export function isFormulaRenderable(node: FormulaNode, fontSize = 18): boolean {
+  return !renderFormulaToHTML(node, fontSize).includes('fm-render-error');
+}
+
+export function clearRenderCache(): void {
+  // KaTeX rendering is deterministic; palette markup itself is cached by MathToolsPanel.
 }

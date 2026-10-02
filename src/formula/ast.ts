@@ -1,5 +1,5 @@
 // ─── Formula AST Operations ─── Thao tác cây AST cho Formula Editor ───
-import type { FormulaNode, NodeType, NodeRole, CursorPosition } from './types';
+import type { FormulaNode, NodeType, NodeRole, CursorPosition, MatrixDelimiter, AccentKind } from './types';
 
 let _counter = 0;
 export function nodeId(): string {
@@ -81,41 +81,87 @@ export function createSupSub(base?: FormulaNode[], sup?: FormulaNode[], sub?: Fo
   return createNode('supsub', undefined, [b, sp, sb]);
 }
 
-export function createIntegral(lower?: FormulaNode[], upper?: FormulaNode[], body?: FormulaNode[]): FormulaNode {
-  const lo = createRow(lower || []); lo.role = 'lower';
-  const up = createRow(upper || []); up.role = 'upper';
-  const bd = createRow(body || []); bd.role = 'body';
-  return createNode('integral', '∫', [lo, up, bd]);
+function createFormulaSlot(nodes: FormulaNode[] | undefined, role: NodeRole, initiallyEmpty = false): FormulaNode {
+  const row = createRow(nodes || []);
+  row.role = role;
+  if (!nodes || nodes.length === 0) row.meta = { ...row.meta, isPlaceholder: initiallyEmpty };
+  else row.meta = { ...row.meta, isPlaceholder: false };
+  return row;
+}
+
+export function createIntegral(
+  lower?: FormulaNode[], upper?: FormulaNode[], body?: FormulaNode[], operator = 'int'
+): FormulaNode {
+  return createNode('integral', operator, [
+    createFormulaSlot(lower, 'lower', true),
+    createFormulaSlot(upper, 'upper', true),
+    createFormulaSlot(body, 'body', true),
+  ]);
 }
 
 export function createSum(lower?: FormulaNode[], upper?: FormulaNode[], body?: FormulaNode[]): FormulaNode {
-  const lo = createRow(lower || []); lo.role = 'lower';
-  const up = createRow(upper || []); up.role = 'upper';
-  const bd = createRow(body || []); bd.role = 'body';
-  return createNode('sum', '∑', [lo, up, bd]);
+  return createNode('sum', 'sum', [
+    createFormulaSlot(lower, 'lower', true),
+    createFormulaSlot(upper, 'upper', true),
+    createFormulaSlot(body, 'body', true),
+  ]);
 }
 
 export function createProduct(lower?: FormulaNode[], upper?: FormulaNode[], body?: FormulaNode[]): FormulaNode {
-  const lo = createRow(lower || []); lo.role = 'lower';
-  const up = createRow(upper || []); up.role = 'upper';
-  const bd = createRow(body || []); bd.role = 'body';
-  return createNode('product', '∏', [lo, up, bd]);
+  return createNode('product', 'prod', [
+    createFormulaSlot(lower, 'lower', true),
+    createFormulaSlot(upper, 'upper', true),
+    createFormulaSlot(body, 'body', true),
+  ]);
 }
 
-export function createLimit(variable?: FormulaNode[], body?: FormulaNode[]): FormulaNode {
-  const lo = createRow(variable || []); lo.role = 'lower';
-  const bd = createRow(body || []); bd.role = 'body';
-  return createNode('limit', 'lim', [lo, bd]);
+export function createLimit(variable?: FormulaNode[], body?: FormulaNode[], operator: 'lim' | 'min' | 'max' = 'lim'): FormulaNode {
+  return createNode('limit', operator, [
+    createFormulaSlot(variable, 'lower', true),
+    createFormulaSlot(body, 'body', true),
+  ]);
 }
 
-export function createMatrix(rows: number, cols: number): FormulaNode {
+export function createPiecewise(rows = 2): FormulaNode {
+  const safeRows = Math.max(1, Math.min(6, Math.floor(rows) || 2));
+  return createNode('piecewise', String(safeRows), Array.from({ length: safeRows * 2 }, () => createRow([])));
+}
+
+export function createSystem(rows = 2): FormulaNode {
+  const safeRows = Math.max(1, Math.min(6, Math.floor(rows) || 2));
+  return createNode('system', String(safeRows), Array.from({ length: safeRows }, () => createRow([])));
+}
+
+export function createAligned(rows = 2): FormulaNode {
+  const safeRows = Math.max(1, Math.min(6, Math.floor(rows) || 2));
+  return createNode('aligned', String(safeRows), Array.from({ length: safeRows * 2 }, () => createRow([])));
+}
+
+export function createAbsolute(inner?: FormulaNode[]): FormulaNode {
+  return createNode('absolute', undefined, [createRow(inner || [])]);
+}
+
+export function createNorm(inner?: FormulaNode[]): FormulaNode {
+  return createNode('norm', undefined, [createRow(inner || [])]);
+}
+
+export function createAccent(accent: AccentKind, inner?: FormulaNode[]): FormulaNode {
+  return createNode('accent', accent, [createRow(inner || [])]);
+}
+
+export function createDifferential(variable?: FormulaNode[]): FormulaNode {
+  return createNode('differential', undefined, [createRow(variable || [])]);
+}
+
+export function createMatrix(rows: number, cols: number, delimiter: MatrixDelimiter = 'pmatrix'): FormulaNode {
+  const safeRows = Math.max(1, Math.min(8, Math.floor(rows) || 2));
+  const safeCols = Math.max(1, Math.min(8, Math.floor(cols) || 2));
   const children: FormulaNode[] = [];
-  for (let r = 0; r < rows; r++) {
-    for (let c = 0; c < cols; c++) {
-      children.push(createRow([]));
-    }
+  for (let row = 0; row < safeRows; row++) {
+    for (let col = 0; col < safeCols; col++) children.push(createRow([]));
   }
-  const node = createNode('matrix', `${rows}x${cols}`, children);
+  const node = createNode('matrix', `${safeRows}x${safeCols}`, children);
+  node.meta = { ...node.meta, matrixDelimiter: delimiter };
   return node;
 }
 
@@ -248,77 +294,123 @@ export function nextPlaceholder(root: FormulaNode, currentId: string): FormulaNo
   return null;
 }
 
-/** Serialize AST → chuỗi LaTeX (optional export) */
+/** Serialize the editable Telex AST to a safe TeX string for KaTeX. */
 export function serializeToLatex(node: FormulaNode): string {
+  const children = node.children || [];
+  const content = (child?: FormulaNode): string => child ? serializeToLatex(child) : '';
+  const isEmptySlot = (child?: FormulaNode): boolean => !child || child.meta?.isPlaceholder === true;
+  const slot = (child?: FormulaNode): string => isEmptySlot(child) ? '' : content(child);
+
   switch (node.type) {
     case 'symbol': return node.value || '';
     case 'operator': return ` ${node.value || ''} `;
     case 'number': return node.value || '';
-    case 'text': return `\\text{${node.value || ''}}`;
-    case 'placeholder': return '{\\square}';
-
-    case 'row':
-      return (node.children || []).map(serializeToLatex).join('');
-
+    case 'text': {
+      const escaped = (node.value || '').replace(/\\/g, '\\textbackslash{}').replace(/([#$%&_{}])/g, '\\$1');
+      return `\\text{${escaped}}`;
+    }
+    case 'placeholder': return '\\square';
+    case 'row': return children.map(serializeToLatex).join('');
     case 'fraction': {
-      const [n, d] = node.children || [];
-      return `\\frac{${serializeToLatex(n)}}{${serializeToLatex(d)}}`;
+      const [numerator, denominator] = children;
+      return `\\frac{${content(numerator)}}{${content(denominator)}}`;
     }
     case 'root': {
-      const [body, index] = node.children || [];
-      if (index) return `\\sqrt[${serializeToLatex(index)}]{${serializeToLatex(body)}}`;
-      return `\\sqrt{${serializeToLatex(body)}}`;
+      const [body, index] = children;
+      return index ? `\\sqrt[${content(index)}]{${content(body)}}` : `\\sqrt{${content(body)}}`;
     }
     case 'sup': {
-      const [base, sup] = node.children || [];
-      return `{${serializeToLatex(base)}}^{${serializeToLatex(sup)}}`;
+      const [base, sup] = children;
+      return `{${content(base)}}^{${content(sup)}}`;
     }
     case 'sub': {
-      const [base, sub] = node.children || [];
-      return `{${serializeToLatex(base)}}_{${serializeToLatex(sub)}}`;
+      const [base, sub] = children;
+      return `{${content(base)}}_{${content(sub)}}`;
     }
     case 'supsub': {
-      const [base, sup, sub] = node.children || [];
-      return `{${serializeToLatex(base)}}_{${serializeToLatex(sub)}}^{${serializeToLatex(sup)}}`;
+      const [base, sup, sub] = children;
+      return `{${content(base)}}_{${content(sub)}}^{${content(sup)}}`;
     }
     case 'integral': {
-      const [lower, upper, body] = node.children || [];
-      return `\\int_{${serializeToLatex(lower)}}^{${serializeToLatex(upper)}} ${serializeToLatex(body)}`;
+      const [lower, upper, body] = children;
+      const command = node.value === 'iint' || node.value === 'iiint' || node.value === 'oint' ? node.value : 'int';
+      const lowerLimit = isEmptySlot(lower) ? '' : `\\limits_{${slot(lower)}}`;
+      const upperLimit = isEmptySlot(upper) ? '' : `^{${slot(upper)}}`;
+      return `\\${command}${lowerLimit}${upperLimit}${slot(body)}`;
     }
     case 'sum': {
-      const [lower, upper, body] = node.children || [];
-      return `\\sum_{${serializeToLatex(lower)}}^{${serializeToLatex(upper)}} ${serializeToLatex(body)}`;
+      const [lower, upper, body] = children;
+      const lowerLimit = isEmptySlot(lower) ? '' : `\\limits_{${slot(lower)}}`;
+      const upperLimit = isEmptySlot(upper) ? '' : `^{${slot(upper)}}`;
+      return `\\sum${lowerLimit}${upperLimit}${slot(body)}`;
     }
     case 'product': {
-      const [lower, upper, body] = node.children || [];
-      return `\\prod_{${serializeToLatex(lower)}}^{${serializeToLatex(upper)}} ${serializeToLatex(body)}`;
+      const [lower, upper, body] = children;
+      const lowerLimit = isEmptySlot(lower) ? '' : `\\limits_{${slot(lower)}}`;
+      const upperLimit = isEmptySlot(upper) ? '' : `^{${slot(upper)}}`;
+      return `\\prod${lowerLimit}${upperLimit}${slot(body)}`;
     }
     case 'limit': {
-      const [variable, body] = node.children || [];
-      return `\\lim_{${serializeToLatex(variable)}} ${serializeToLatex(body)}`;
+      const [variable, body] = children;
+      const command = node.value === 'min' || node.value === 'max' ? node.value : 'lim';
+      const lowerLimit = isEmptySlot(variable) ? '' : `\\limits_{${slot(variable)}}`;
+      return `\\${command}${lowerLimit}${slot(body)}`;
     }
-    case 'parens':
-      return `\\left(${serializeToLatex((node.children || [])[0])}\\right)`;
-    case 'brackets':
-      return `\\left[${serializeToLatex((node.children || [])[0])}\\right]`;
-    case 'braces':
-      return `\\left\\{${serializeToLatex((node.children || [])[0])}\\right\\}`;
-
+    case 'parens': return `\\left(${content(children[0])}\\right)`;
+    case 'brackets': return `\\left[${content(children[0])}\\right]`;
+    case 'braces': return node.value === 'left-open'
+      ? `\\left\\{${content(children[0])}\\right.`
+      : `\\left\\{${content(children[0])}\\right\\}`;
+    case 'absolute': return `\\left|${content(children[0])}\\right|`;
+    case 'norm': return `\\left\\|${content(children[0])}\\right\\|`;
+    case 'accent': {
+      const body = content(children[0]);
+      if (node.value === 'arc') return `\\overset{\\frown}{${body}}`;
+      const accent = node.value === 'bar' ? 'overline' : node.value === 'vec' ? 'vec' : node.value === 'overrightarrow' ? 'overrightarrow' : node.value === 'widehat' ? 'widehat' : 'hat';
+      return `\\${accent}{${body}}`;
+    }
+    case 'differential': return `\\,\\mathrm{d}${content(children[0])}`;
+    case 'multiline': {
+      const rows = children.map(child => serializeToLatex(child) || '\\vphantom{0}');
+      return `\\begin{gathered}${rows.join(' \\\\ ')}\\end{gathered}`;
+    }
+    case 'piecewise':
+    case 'aligned': {
+      const rows = Math.max(1, Math.min(6, Number(node.value) || Math.ceil(children.length / 2) || 1));
+      const body = Array.from({ length: rows }, (_, row) => `${content(children[row * 2])} & ${content(children[row * 2 + 1])}`).join(' \\\\ ');
+      const environment = node.type === 'aligned' ? 'aligned' : 'cases';
+      return `\\begin{${environment}}${body}\\end{${environment}}`;
+    }
+    case 'system': {
+      const rows = Math.max(1, Math.min(6, Number(node.value) || children.length || 1));
+      const body = Array.from({ length: rows }, (_, row) => content(children[row])).join(' \\\\ ');
+      return `\\begin{cases}${body}\\end{cases}`;
+    }
     case 'matrix': {
-      const [rows, cols] = (node.value || '2x2').split('x').map(Number);
-      const cells = node.children || [];
-      let result = '\\begin{pmatrix}';
-      for (let r = 0; r < rows; r++) {
-        if (r > 0) result += ' \\\\ ';
-        for (let c = 0; c < cols; c++) {
-          if (c > 0) result += ' & ';
-          result += serializeToLatex(cells[r * cols + c]);
+      const [rawRows, rawCols] = (node.value || '2x2').split('x').map(Number);
+      const rows = Number.isFinite(rawRows) ? Math.max(1, Math.min(8, rawRows)) : 2;
+      const cols = Number.isFinite(rawCols) ? Math.max(1, Math.min(8, rawCols)) : 2;
+      const rowsLatex = Array.from({ length: rows }, (_, row) =>
+        Array.from({ length: cols }, (_, col) => content(children[row * cols + col])).join(' & ')
+      ).join(' \\\\ ');
+      const rawDelimiter = node.meta?.matrixDelimiter;
+      const layout = node.meta?.matrixLayout;
+      if (layout) {
+        const columnSpec = Array.from({ length: cols }, (_, col) => layout === 'aligned' && col % 2 === 0 ? 'r' : 'l').join('');
+        const array = `\\begin{array}{${columnSpec}}${rowsLatex}\\end{array}`;
+        switch (rawDelimiter) {
+          case 'braces': return `\\left\\{${array}\\right\\}`;
+          case 'left-brace': return `\\left\\{${array}\\right.`;
+          case 'left-square': return `\\left[${array}\\right.`;
+          case 'square': return `\\left[${array}\\right]`;
+          case 'parentheses': return `\\left(${array}\\right)`;
+          case 'bars': return `\\left|${array}\\right|`;
+          default: return array;
         }
       }
-      result += '\\end{pmatrix}';
-      return result;
+      const delimiter = rawDelimiter === 'bmatrix' || rawDelimiter === 'vmatrix' || rawDelimiter === 'pmatrix' ? rawDelimiter : 'pmatrix';
+      return `\\begin{${delimiter}}${rowsLatex}\\end{${delimiter}}`;
     }
-
     default: return node.value || '';
   }
 }

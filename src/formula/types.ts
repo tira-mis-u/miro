@@ -1,5 +1,9 @@
 // ─── Formula AST Types ─── Thiết kế gần với cách hoạt động của Microsoft Word ───
 
+export type MatrixDelimiter = 'none' | 'braces' | 'left-brace' | 'left-square' | 'square' | 'parentheses' | 'bars' | 'bmatrix' | 'pmatrix' | 'vmatrix';
+export type AccentKind = 'hat' | 'widehat' | 'bar' | 'vec' | 'overrightarrow' | 'arc';
+export type StructuredGridLayout = 'array' | 'matrix' | 'aligned' | 'cases';
+
 export type NodeType =
   // Basic
   | 'symbol'
@@ -20,9 +24,15 @@ export type NodeType =
   | 'limit'
   | 'matrix'
   | 'piecewise'
+  | 'system'
+  | 'aligned'
+  | 'multiline'
+  | 'absolute'
+  | 'norm'
+  | 'accent'
   // Special
   | 'placeholder'
-  | 'differential' // d(x)
+  | 'differential' // upright d(x)
   | 'parens'       // ()
   | 'brackets'     // []
   | 'braces';      // {}
@@ -69,6 +79,8 @@ export interface FormulaNode {
     editable?: boolean;
     locked?: boolean;
     stretch?: boolean;      // for delimiters that stretch
+    matrixDelimiter?: MatrixDelimiter;
+    matrixLayout?: StructuredGridLayout;
   };
 }
 
