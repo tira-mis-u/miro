@@ -1,15 +1,22 @@
 import * as React from 'react';
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react';
+import { createPortal } from 'react-dom';
 import {
-  MousePointer2, PenLine, Eraser, StickyNote, Type,
-  Square, Circle, Triangle, Diamond, Star, MoveRight, Sparkles,
+  MousePointer2, PenLine, Eraser, StickyNote, Type, Sparkles,
   ImageIcon, Undo2, Redo2, ZoomIn, ZoomOut, Maximize2,
   Share2, Play, Timer, Video, MessageSquare, MoreHorizontal,
-  Copy, Trash2, Palette, X, ChevronDown, Check,
-  Code, Calculator, AppWindow
+  Copy, Trash2, Palette, X, ChevronDown, Check, Search,
+  Code, Calculator
 } from 'lucide-react';
-import { CanvasEngine } from './engine/CanvasEngine';
+import { CanvasEngine, getConnectorRoute, isFixedShapeLabel } from './engine/CanvasEngine';
 import type { ToolType, StickyShape, AnyShape } from './engine/CanvasEngine';
+import { listShapePickerDefinitions, getShapeDefinition, getShapeDefinitionForLegacyType, getShapePickerLabel } from './engine/shapes/registry';
+import { geometryCommandsToSvg, shapePreviewGeometry } from './engine/shapes/geometry';
+import { buildConnectorPreviewGeometry } from './engine/shapes/connectors';
+import { SHAPE_CATEGORIES } from './engine/shapes/types';
+import type { Cardinality, EndpointMarker, ShapeCategory, ShapeDefinition, ShapeParameterMetadata, ShapeParameterValue, StrokeStyle } from './engine/shapes/types';
+import { searchShapeDefinitions } from './engine/shapes/search';
+import { solid3DScaleFromBounds, type Solid3DScale } from './engine/shapes/solid3d';
 import { getCanvasShortcutAction } from './engine/keyboardShortcuts';
 import {
   continueWithoutLocalRecovery, getBoardRuntimeStatus, initializeBoardStore, yShapes,
@@ -37,58 +44,143 @@ const TEXT_TOOLS: { id: ToolType; Icon: React.FC<any>; label: string }[] = [
   { id: 'code', Icon: Code, label: 'Code Block' },
 ];
 
-type AddedShapeTool = Extract<ToolType, 'pentagon' | 'hexagon' | 'parallelogram' | 'trapezoid' | 'right-triangle'>;
+const SHAPE_TOOLS = listShapePickerDefinitions().map(definition => ({
+  id: definition.toolId as ToolType,
+  label: definition.label,
+  definition,
+}));
 
-function ShapeGlyph({ kind, size = 16 }: { kind: AddedShapeTool; size?: number }) {
-  const points: Record<AddedShapeTool, string> = {
-    pentagon: '12,2 21.5,9 18,21 6,21 2.5,9',
-    hexagon: '12,2 21,7 21,17 12,22 3,17 3,7',
-    parallelogram: '7,3 22,3 17,21 2,21',
-    trapezoid: '6,3 18,3 22,21 2,21',
-    'right-triangle': '3,3 21,21 3,21',
-  };
-  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" aria-hidden="true">
-    <polygon points={points[kind]} stroke="currentColor" strokeWidth="1.8" strokeLinejoin="round" />
+function ConnectorPreview({ definition }: { definition: ShapeDefinition }) {
+  const preview = buildConnectorPreviewGeometry(definition, 30, 24);
+  const line = geometryCommandsToSvg(preview.route);
+  const dash = preview.lineStyle === 'dashed' ? '3 2' : preview.lineStyle === 'dotted' ? '1 2' : undefined;
+  return <svg width="26" height="22" viewBox={`0 0 ${preview.width} ${preview.height}`} fill="none" aria-hidden="true">
+    <path d={line} stroke="currentColor" strokeWidth="1.8" fill="none" strokeDasharray={dash} strokeLinecap="round" strokeLinejoin="round" />
+    {preview.markers.map((marker, index) => <path key={index} d={geometryCommandsToSvg(marker.commands)}
+      fill={marker.fill === 'surface' ? 'var(--aw-paper, #fff)' : marker.fill} stroke="currentColor"
+      strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" />)}
+    {definition.defaultLabel && <text x="15" y="4" textAnchor="middle" fill="currentColor" fontSize="3.2" fontWeight="700">{definition.defaultLabel}</text>}
   </svg>;
 }
 
-const PentagonIcon: React.FC<{ size?: number }> = ({ size }) => <ShapeGlyph kind="pentagon" size={size} />;
-const HexagonIcon: React.FC<{ size?: number }> = ({ size }) => <ShapeGlyph kind="hexagon" size={size} />;
-const ParallelogramIcon: React.FC<{ size?: number }> = ({ size }) => <ShapeGlyph kind="parallelogram" size={size} />;
-const TrapezoidIcon: React.FC<{ size?: number }> = ({ size }) => <ShapeGlyph kind="trapezoid" size={size} />;
-const RightTriangleIcon: React.FC<{ size?: number }> = ({ size }) => <ShapeGlyph kind="right-triangle" size={size} />;
+function ShapePreview({ definition, size = 24 }: { definition: ShapeDefinition; size?: number }) {
+  if (definition.kind === 'connector') return <ConnectorPreview definition={definition} />;
+  const geometry = shapePreviewGeometry(definition, 28, 22);
+  const outline = geometryCommandsToSvg(geometry.outline);
+  const decorations = geometry.decorations.map(geometryCommandsToSvg);
+  const intrinsicFills = geometry.intrinsicFills.map(geometryCommandsToSvg);
+  const hiddenEdges = geometry.hiddenEdges.map(geometryCommandsToSvg);
+  const defaultDash = definition.defaultParams?.lineStyle === 'dashed' ? '2 1.6' : definition.defaultParams?.lineStyle === 'dotted' ? '1 1.7' : undefined;
+  return <svg width={size} height={size} viewBox="-1 -1 30 24" fill="none" aria-hidden="true">
+    {!definition.solid3d && <path d={outline} fill="none" stroke="currentColor" strokeWidth="1.35" strokeLinejoin="round" strokeLinecap="round" strokeDasharray={defaultDash} />}
+    {intrinsicFills.map((path, index) => <path key={`intrinsic-${index}`} d={path} fill="currentColor" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round" />)}
+    {decorations.map((path, index) => {
+      const style = geometry.decorationStyles[index];
+      const dash = style === 'dashed' ? '2 1.6' : style === 'dotted' ? '1 1.7' : style === 'solid' ? undefined : defaultDash;
+      return <path key={`visible-${index}`} d={path} fill="none" stroke="currentColor" strokeWidth="1.1" strokeLinejoin="round" strokeLinecap="round" strokeDasharray={dash} />;
+    })}
+    {hiddenEdges.map((path, index) => <path key={`hidden-${index}`} d={path} fill="none" stroke="currentColor" strokeWidth="1.25" strokeDasharray="3.1 2" strokeLinecap="round" opacity=".96" />)}
+    {definition.previewGlyph && <text x="14" y="12" textAnchor="middle" dominantBaseline="central" fill="currentColor" fontSize="4.2" fontWeight="750">{definition.previewGlyph}</text>}
+  </svg>;
+}
 
-const BASIC_SHAPE_TOOLS: { id: ToolType; Icon: React.FC<any>; label: string }[] = [
-  { id: 'rect', Icon: Square, label: 'Rectangle' },
-  { id: 'rounded-rect', Icon: AppWindow, label: 'Rounded rectangle' },
-  { id: 'ellipse', Icon: Circle, label: 'Ellipse' },
-  { id: 'diamond', Icon: Diamond, label: 'Diamond' },
-  { id: 'star', Icon: Star, label: 'Star' },
-  { id: 'triangle', Icon: Triangle, label: 'Triangle' },
-  { id: 'callout', Icon: MessageSquare, label: 'Callout' },
-  { id: 'arrow', Icon: MoveRight, label: 'Arrow' },
-];
-const ADDITIONAL_SHAPE_TOOLS: { id: ToolType; Icon: React.FC<any>; label: string }[] = [
-  { id: 'pentagon', Icon: PentagonIcon, label: 'Pentagon' },
-  { id: 'hexagon', Icon: HexagonIcon, label: 'Hexagon' },
-  { id: 'parallelogram', Icon: ParallelogramIcon, label: 'Parallelogram' },
-  { id: 'trapezoid', Icon: TrapezoidIcon, label: 'Trapezoid' },
-  { id: 'right-triangle', Icon: RightTriangleIcon, label: 'Right triangle' },
-];
-const SHAPE_TOOLS = [...BASIC_SHAPE_TOOLS, ...ADDITIONAL_SHAPE_TOOLS];
+function ShapeParameterField({ parameter, value, onUpdate }: {
+  parameter: ShapeParameterMetadata;
+  value: ShapeParameterValue;
+  onUpdate: (key: string, value: ShapeParameterValue, commit: boolean) => void;
+}) {
+  const control = parameter.control;
+  if (!control) return null;
+  const current = value ?? parameter.defaultValue;
+  const update = (nextValue: ShapeParameterValue, commit: boolean) => onUpdate(parameter.key, nextValue, commit);
+  if (control.type === 'range') {
+    const numeric = typeof current === 'number' ? current : Number(current);
+    const rangeValue = Number.isFinite(numeric) ? numeric : Number(parameter.defaultValue);
+    const shown = control.precision === 0 ? String(Math.round(rangeValue)) : rangeValue.toFixed(control.precision ?? 2);
+    return <label className="shape-property-field shape-property-range-field" title={parameter.description}>
+      <span>{parameter.label} · {shown}{control.unit ?? ''}</span>
+      <input type="range" min={control.min} max={control.max} step={control.step} value={rangeValue}
+        aria-label={parameter.label} data-param-key={parameter.key}
+        onChange={event => update(Number(event.target.value), false)}
+        onPointerUp={event => update(Number(event.currentTarget.value), true)}
+        onBlur={event => update(Number(event.currentTarget.value), true)} />
+    </label>;
+  }
+  if (control.type === 'select') {
+    const selected = control.options.find(option => String(option.value) === String(current))?.value ?? current;
+    return <label className="shape-property-field" title={parameter.description}>
+      <span>{parameter.label}</span>
+      <select aria-label={parameter.label} data-param-key={parameter.key} value={String(selected)}
+        onChange={event => {
+          const option = control.options.find(candidate => String(candidate.value) === event.target.value);
+          if (option) update(option.value, true);
+        }}>
+        {control.options.map(option => <option key={String(option.value)} value={String(option.value)}>{option.label}</option>)}
+      </select>
+    </label>;
+  }
+  if (control.type === 'checkbox') return <label className="shape-property-check" title={parameter.description}>
+    <input type="checkbox" aria-label={parameter.label} data-param-key={parameter.key} checked={Boolean(current)}
+      onChange={event => update(event.target.checked, true)} />{parameter.label}
+  </label>;
+  return <label className="shape-property-field" title={parameter.description}>
+      <span>{parameter.label}</span>
+      <input type="text" aria-label={parameter.label} data-param-key={parameter.key} value={String(current)}
+        maxLength={control.maxLength} placeholder={control.placeholder}
+        onChange={event => update(event.target.value, false)} onBlur={event => update(event.currentTarget.value, true)} />
+  </label>;
+}
+
+function SolidDimensionFields({ shapeId, scale, onUpdate }: {
+  shapeId: string;
+  scale: Solid3DScale;
+  onUpdate: (axis: keyof Solid3DScale, value: number, commit: boolean) => void;
+}) {
+  const [drafts, setDrafts] = useState<Partial<Record<keyof Solid3DScale, string>>>({});
+  useEffect(() => setDrafts({}), [shapeId]);
+  const dimensions: Array<{ axis: keyof Solid3DScale; label: string }> = [
+    { axis: 'x', label: 'Local width · X' },
+    { axis: 'y', label: 'Local height · Y' },
+    { axis: 'z', label: 'Local depth · Z' },
+  ];
+  return <section className="shape-property-section" data-solid-dimensions>
+    <h4>Independent local dimensions</h4>
+    <p>Each factor scales real model geometry before local XYZ rotation. Depth/height parameters remain separate.</p>
+    <div className="shape-property-grid-two">
+      {dimensions.map(({ axis, label }) => <label className="shape-property-field" key={axis}>
+        <span>{label} · {scale[axis].toFixed(2)}×</span>
+        <input type="number" min="0.01" max="64" step="0.01" value={drafts[axis] ?? scale[axis].toFixed(2)}
+          aria-label={`${label} scale`} data-solid-scale-key={axis}
+          onChange={event => {
+            const raw = event.target.value;
+            setDrafts(previous => ({ ...previous, [axis]: raw }));
+            if (raw.trim() && Number.isFinite(Number(raw))) onUpdate(axis, Number(raw), false);
+          }}
+          onBlur={event => {
+            const raw = drafts[axis] ?? event.currentTarget.value;
+            if (raw.trim() && Number.isFinite(Number(raw))) onUpdate(axis, Number(raw), true);
+            setDrafts(previous => ({ ...previous, [axis]: undefined }));
+          }}
+          onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }} />
+      </label>)}
+    </div>
+  </section>;
+}
 
 type PopoverGroup = 'pen' | 'shapes' | 'text' | 'select';
 
 // Math symbols và auto-replace đã được chuyển sang formula/parser.ts
 // MATH_SYMBOLS và AUTO_REPLACE không còn cần ở đây
 
-function PopoverItem({ active, onClick, Icon, label, grid }: { active: boolean; onClick: (e: React.MouseEvent) => void; Icon: any; label: string; grid?: boolean }) {
+function PopoverItem({ active, onClick, Icon, preview, label, grid, shapeId, solid3d }: { active: boolean; onClick: (e: React.MouseEvent) => void; Icon?: any; preview?: React.ReactNode; label: string; grid?: boolean; shapeId?: string; solid3d?: boolean }) {
   return (
     <button type="button" onClick={onClick} title={label} aria-label={label} aria-pressed={active}
+      {...(shapeId ? { 'data-shape-id': shapeId } : {})}
+      {...(solid3d ? { 'data-solid3d': 'true' } : {})}
       className={`popover-item${grid ? ' popover-shape-item' : ''}`}>
-      <span className="popover-item-icon"><Icon size={grid ? 16 : 15} /></span>
+      <span className="popover-item-icon">{preview ?? (Icon ? <Icon size={grid ? 16 : 15} /> : null)}</span>
       <span className="popover-item-label">{label}</span>
-      {active && <Check size={15} className="popover-item-check" aria-hidden="true" />}
+      {active && !grid && <Check size={15} className="popover-item-check" aria-hidden="true" />}
     </button>
   );
 }
@@ -136,6 +228,10 @@ export default function App() {
   const [boardName, setBoardName] = useState('Untitled');
   const [editName, setEditName] = useState(false);
   const [selIds, setSelIds] = useState<string[]>([]);
+  const [selectedShape, setSelectedShape] = useState<AnyShape | null>(null);
+  const [shapePropertiesOpen, setShapePropertiesOpen] = useState(false);
+  const shapePropertiesPanelRef = useRef<HTMLElement>(null);
+  const shapePropertiesTriggerRef = useRef<HTMLButtonElement>(null);
 
   // text/sticky edit overlay
   const [editShape, setEditShape] = useState<AnyShape | null>(null);
@@ -165,6 +261,8 @@ export default function App() {
   const [sw, setSw] = useState(2);
   const [stickyBg, setStickyBg] = useState('#fef08a');
   const [fontSize, setFontSize] = useState(14);
+  const engineStyleRef = useRef({ penColor, penSize, fill, stroke, sw, stickyBg, fontSize });
+  engineStyleRef.current = { penColor, penSize, fill, stroke, sw, stickyBg, fontSize };
 
   const [openGroup, setOpenGroup] = useState<PopoverGroup | null>(null);
   const [penMode, setPenMode] = useState<'normal' | 'smart'>('normal');
@@ -173,9 +271,11 @@ export default function App() {
   const [popoverPosition, setPopoverPosition] = useState<{ left: number; top: number } | null>(null);
   const [lastTextTool, setLastTextTool] = useState<ToolType>('text');
   const [lastShapeTool, setLastShapeTool] = useState<ToolType>('rect');
+  const [shapeCategory, setShapeCategory] = useState<ShapeCategory>('Basic');
+  const [shapeSearch, setShapeSearch] = useState('');
   const [lastSelectTool, setLastSelectTool] = useState<ToolType>('select');
 
-  const setTool = (t: ToolType, keepOpen: boolean = false) => {
+  const setTool = useCallback((t: ToolType, keepOpen: boolean = false) => {
     setToolSt(t);
     // When manually selecting a tool, close any other open groups
     if (!keepOpen) setOpenGroup(null);
@@ -183,7 +283,7 @@ export default function App() {
     if (['text', 'math', 'code'].includes(t)) setLastTextTool(t);
     if (SHAPE_TOOLS.some(s => s.id === t)) setLastShapeTool(t);
     if (['select', 'lasso-select'].includes(t)) setLastSelectTool(t);
-  };
+  }, []);
 
   const choosePopoverTool = (t: ToolType) => {
     const group = openGroup;
@@ -219,6 +319,17 @@ export default function App() {
     setPanelOpen(false);
     if (restoreFocus) window.requestAnimationFrame(() => panelTriggerRef.current?.focus());
   }, []);
+
+  const closeShapeProperties = useCallback((restoreFocus = false) => {
+    setShapePropertiesOpen(false);
+    if (restoreFocus) window.requestAnimationFrame(() => shapePropertiesTriggerRef.current?.focus());
+  }, []);
+
+  useEffect(() => {
+    if (!shapePropertiesOpen) return;
+    const frame = window.requestAnimationFrame(() => shapePropertiesPanelRef.current?.focus());
+    return () => window.cancelAnimationFrame(frame);
+  }, [shapePropertiesOpen]);
 
   useEffect(() => {
     if (!panelOpen) return;
@@ -259,6 +370,36 @@ export default function App() {
     }
   }, [closeStylePanel]);
 
+  useEffect(() => {
+    const rootStyle = document.documentElement.style;
+    const viewport = window.visualViewport;
+    const updateVisualViewport = () => {
+      const left = viewport?.offsetLeft ?? 0;
+      const top = viewport?.offsetTop ?? 0;
+      const width = Math.max(1, viewport?.width ?? window.innerWidth);
+      const height = Math.max(1, viewport?.height ?? window.innerHeight);
+      const railWidth = Number.parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--aw-tool-rail-width')) || 0;
+      rootStyle.setProperty('--aw-visual-viewport-left', `${left}px`);
+      rootStyle.setProperty('--aw-visual-viewport-top', `${top}px`);
+      rootStyle.setProperty('--aw-visual-viewport-right', `${left + width}px`);
+      rootStyle.setProperty('--aw-visual-viewport-bottom', `${top + height}px`);
+      rootStyle.setProperty('--aw-visual-viewport-width', `${width}px`);
+      rootStyle.setProperty('--aw-visual-viewport-height', `${height}px`);
+      rootStyle.setProperty('--aw-visual-viewport-content-center-x', `${left + railWidth + (width - railWidth) / 2}px`);
+    };
+    updateVisualViewport();
+    window.addEventListener('resize', updateVisualViewport, { passive: true });
+    viewport?.addEventListener('resize', updateVisualViewport, { passive: true });
+    viewport?.addEventListener('scroll', updateVisualViewport, { passive: true });
+    return () => {
+      window.removeEventListener('resize', updateVisualViewport);
+      viewport?.removeEventListener('resize', updateVisualViewport);
+      viewport?.removeEventListener('scroll', updateVisualViewport);
+      for (const variable of ['left', 'top', 'right', 'bottom', 'width', 'height', 'content-center-x'])
+        rootStyle.removeProperty(`--aw-visual-viewport-${variable}`);
+    };
+  }, []);
+
   useLayoutEffect(() => {
     if (!openGroup) {
       setPopoverPosition(null);
@@ -272,19 +413,37 @@ export default function App() {
       const anchorRect = anchor.getBoundingClientRect();
       const panelRect = panel.getBoundingClientRect();
       const margin = 8;
-      const maxLeft = Math.max(margin, window.innerWidth - panelRect.width - margin);
+      const viewport = window.visualViewport;
+      const viewportLeft = viewport?.offsetLeft ?? 0;
+      const viewportTop = viewport?.offsetTop ?? 0;
+      const viewportWidth = viewport?.width ?? Math.min(window.innerWidth, document.documentElement.clientWidth || window.innerWidth);
+      const viewportHeight = viewport?.height ?? Math.min(window.innerHeight, document.documentElement.clientHeight || window.innerHeight);
+      const minLeft = viewportLeft + margin;
+      const maxLeft = Math.max(minLeft, viewportLeft + viewportWidth - panelRect.width - margin);
       let left = anchorRect.right + 8;
       if (left > maxLeft) left = anchorRect.left - panelRect.width - 8;
-      left = Math.max(margin, Math.min(left, maxLeft));
-      const maxTop = Math.max(margin, window.innerHeight - panelRect.height - margin);
-      const top = Math.max(margin, Math.min(anchorRect.top, maxTop));
+      left = Math.max(minLeft, Math.min(left, maxLeft));
+      const minTop = viewportTop + margin;
+      const maxTop = Math.max(minTop, viewportTop + viewportHeight - panelRect.height - margin);
+      const top = Math.max(minTop, Math.min(anchorRect.top, maxTop));
       setPopoverPosition({ left, top });
     };
 
     placePopover();
+    const resizeObserver = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(placePopover) : null;
+    resizeObserver?.observe(panel);
     window.addEventListener('resize', placePopover);
-    return () => window.removeEventListener('resize', placePopover);
-  }, [openGroup]);
+    window.addEventListener('scroll', placePopover, true);
+    window.visualViewport?.addEventListener('resize', placePopover);
+    window.visualViewport?.addEventListener('scroll', placePopover);
+    return () => {
+      resizeObserver?.disconnect();
+      window.removeEventListener('resize', placePopover);
+      window.removeEventListener('scroll', placePopover, true);
+      window.visualViewport?.removeEventListener('resize', placePopover);
+      window.visualViewport?.removeEventListener('scroll', placePopover);
+    };
+  }, [openGroup, shapeCategory, shapeSearch]);
 
   const beginBoardInitialization = useCallback(() => {
     setBoardRestoreError(null);
@@ -311,9 +470,16 @@ export default function App() {
     cv.height = wrap.clientHeight;
 
     const eng = new CanvasEngine(cv, yShapes);
+    // The style-sync effect may already have run while board restoration was pending.
+    // Apply the current UI values at construction so new shapes use Antiwhite defaults.
+    eng.style = { ...engineStyleRef.current };
     engRef.current = eng;
 
-    eng.onSel = ids => setSelIds(ids);
+    eng.onSel = ids => {
+      setSelIds(ids);
+      setSelectedShape(ids.length === 1 ? eng.getShape(ids[0]) : null);
+      if (ids.length !== 1) setShapePropertiesOpen(false);
+    };
     eng.onCursor = setCursor;
     eng.onCameraChange = (c) => { setCam(c); setZoom(c.zoom); };
     eng.onZoom = (z) => { setZoom(z); setCam(prev => ({ ...prev, zoom: z })); };
@@ -331,6 +497,7 @@ export default function App() {
     };
 
     eng.onShapeUpdate = s => {
+      if (eng.sel.has(s.id)) setSelectedShape(s);
       if (editShapeRef.current?.id !== s.id) return;
       const updated = s as any;
       if (typeof updated.text === 'string') {
@@ -383,7 +550,7 @@ export default function App() {
       const s = shape as any;
       const sp = eng.worldToClient(s.x, s.y);
 
-      let l = sp.x, t = sp.y;
+      const l = sp.x, t = sp.y;
       // Precision positioning handled by FormulaEditor's world-coordinate internal logic.
       // We pass the raw sp coordinates here as the anchor.
 
@@ -424,7 +591,7 @@ export default function App() {
     // Window listeners keep drawing, erasing, and panning coherent outside the canvas bounds.
     const onMove = (e: PointerEvent) => eng.pointerMove(e);
     const onUp = (e: PointerEvent) => eng.pointerUp(e);
-    const onCancel = () => eng.cancelPointer();
+    const onCancel = (e: PointerEvent) => eng.cancelPointer(e);
     const onBlur = () => eng.cancelPointer();
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
@@ -456,7 +623,7 @@ export default function App() {
   // sync style options
   useEffect(() => {
     const eng = engRef.current; if (!eng) return;
-    eng.style = { penColor, penSize, fill, stroke, sw, stickyBg, fontSize };
+    eng.style = { ...engineStyleRef.current };
   }, [penColor, penSize, fill, stroke, sw, stickyBg, fontSize]);
 
   useEffect(() => { engRef.current?.setPenMode(penMode); }, [penMode]);
@@ -516,7 +683,7 @@ export default function App() {
       const previewText = lastValidPreview ?? storedPreview;
       if (!committedText.trim() && !previewText.trim()) eng.deleteShape(editShape.id);
       else eng.updateFormula(editShape.id, committedText, previewText);
-    } else if (committedText.trim() === '') {
+    } else if (committedText.trim() === '' && !isFixedShapeLabel(editShape)) {
       eng.deleteShape(editShape.id);
     } else if (editShape.type === 'code') {
       eng.updateCode(editShape.id, committedText, editLanguage);
@@ -568,7 +735,7 @@ export default function App() {
     if (id) engRef.current?.updatePos(id, x, y);
   }, []);
 
-  const editShapeFontSize = editShape && 'fs' in editShape ? editShape.fs : 14;
+  const editShapeFontSize = editShape && 'fs' in editShape ? editShape.fs ?? 14 : 14;
   const formulaFontSize = editShape?.type === 'math' ? editShapeFontSize : 14;
   const codeEditorInitialCursor = editShape?.type === 'code'
     ? estimateCodeCursor(editText, editClick.x, editClick.y, editBox, zoom, editShapeFontSize)
@@ -596,6 +763,41 @@ export default function App() {
     fr.readAsDataURL(f);
     e.target.value = '';
     setTool('select');
+  };
+
+  const shapeSearchNeedle = shapeSearch.trim();
+  const visibleShapeTools = (shapeSearchNeedle
+    ? searchShapeDefinitions(shapeSearchNeedle).map(definition => ({
+      id: definition.toolId as ToolType, label: getShapePickerLabel(definition, definition.category), definition,
+    }))
+    : SHAPE_TOOLS.filter(({ definition }) => definition.category === shapeCategory || definition.pickerCategories?.includes(shapeCategory)))
+    .map(item => ({ ...item, label: getShapePickerLabel(item.definition, shapeSearchNeedle ? item.definition.category : shapeCategory) }));
+  const selectedDiagram = selectedShape?.type === 'diagram' ? selectedShape : null;
+  const selectedConnector = selectedShape?.type === 'connector' ? selectedShape : null;
+  const selectedLegacyDefinition = selectedShape && selectedShape.type !== 'diagram' && selectedShape.type !== 'connector'
+    && 'x' in selectedShape && 'y' in selectedShape && 'w' in selectedShape && 'h' in selectedShape
+    ? getShapeDefinitionForLegacyType(selectedShape.type) : undefined;
+  const selectedPropertyShape = selectedDiagram ?? (selectedLegacyDefinition ? selectedShape : null);
+  const selectedDefinition = selectedDiagram ? getShapeDefinition(selectedDiagram.shapeId) : selectedLegacyDefinition;
+  const selectedSolidScale = selectedDiagram && selectedDefinition?.solid3d
+    ? selectedDiagram.scale3d ?? solid3DScaleFromBounds(selectedDiagram.w, selectedDiagram.h, selectedDefinition.width,
+      selectedDefinition.height, selectedDefinition.geometry as import('./engine/shapes/solid3d').Solid3DGeometry)
+    : null;
+  const selectedPropertyParams = selectedPropertyShape && 'params' in selectedPropertyShape ? selectedPropertyShape.params ?? {} : {};
+  const selectedPropertyText = selectedPropertyShape && 'text' in selectedPropertyShape ? selectedPropertyShape.text ?? '' : '';
+  const classifierModel = selectedDiagram?.data?.classifier as { compartments?: Array<{ id?: string; label?: string; items?: string[] }> } | undefined;
+  const classifierCompartments = Array.isArray(classifierModel?.compartments) ? classifierModel.compartments : [];
+  const tableModel = selectedDiagram?.data?.table as { columns?: Array<{ id?: string; name?: string; type?: string; key?: string }> } | undefined;
+  const tableColumns = Array.isArray(tableModel?.columns) ? tableModel.columns : [];
+  const columnModel = selectedDiagram?.data?.column as { name?: string; type?: string; key?: string } | undefined;
+  const updateClassifierData = (compartments: Array<{ id?: string; label?: string; items?: string[] }>, commit = false) => {
+    if (selectedDiagram && classifierModel) engRef.current?.updateDiagramData(selectedDiagram.id, { classifier: { ...classifierModel, compartments } }, commit);
+  };
+  const updateTableData = (columns: Array<{ id?: string; name?: string; type?: string; key?: string }>, commit = false) => {
+    if (selectedDiagram) engRef.current?.updateDiagramData(selectedDiagram.id, { table: { ...(tableModel ?? {}), columns } }, commit);
+  };
+  const updateColumnData = (column: { name?: string; type?: string; key?: string }, commit = false) => {
+    if (selectedDiagram) engRef.current?.updateDiagramData(selectedDiagram.id, { column }, commit);
   };
 
   const zoomBy = (d: number) => { const e = engRef.current; if (!e) return; e.setCamera(e.cam.x, e.cam.y, Math.max(.04, Math.min(16, e.cam.zoom + d))); };
@@ -675,10 +877,10 @@ export default function App() {
             const group = openGroup;
             setOpenGroup(null);
             popoverAnchorRefs.current[group]?.querySelector('button')?.focus();
-          } else {
+          } else if (!(e.target instanceof HTMLInputElement && ['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight'].includes(e.key))) {
             handlePopoverNavigation(e);
           }
-        }} className="tool-rail">
+        }} className={`tool-rail${openGroup === 'shapes' ? ' tool-rail-shapes-open' : ''}`}>
           <div className="tool-stack">
             {/* SELECT GROUP */}
             <div ref={el => { popoverAnchorRefs.current.select = el }} className="tool-group">
@@ -748,25 +950,43 @@ export default function App() {
                 onClick={() => { const next = openGroup === 'shapes' ? null : 'shapes'; setOpenGroup(next); if (next) setTool(lastShapeTool, true); }}>
                 {(() => {
                   const active = SHAPE_TOOLS.some(s => s.id === tool) ? tool : lastShapeTool;
-                  const entry = SHAPE_TOOLS.find(s => s.id === active);
-                  return entry ? React.createElement(entry.Icon, { size: 17 }) : <Square size={17} />;
+                  const entry = SHAPE_TOOLS.find(s => s.id === active) ?? SHAPE_TOOLS[0];
+                  return <ShapePreview definition={entry.definition} size={21} />;
                 })()}
               </SideBtn>
               {openGroup === 'shapes' && (
-                <div ref={popoverPanelRef} className="tool-popover tool-popover-shapes" role="group" aria-label="Shape tools" onKeyDown={handlePopoverNavigation}
+                <div ref={popoverPanelRef} className="tool-popover tool-popover-shapes" role="group" aria-label="Shape tools"
+                  onKeyDown={e => {
+                    if (e.target instanceof HTMLInputElement && ['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight'].includes(e.key)) return;
+                    handlePopoverNavigation(e);
+                  }}
                   style={{ left: popoverPosition?.left ?? -9999, top: popoverPosition?.top ?? -9999 }}>
-                  <div className="tool-popover-heading">Basic shapes</div>
-                  <div className="shape-option-grid">
-                    {BASIC_SHAPE_TOOLS.map(t => (
-                      <PopoverItem key={t.id} active={SHAPE_TOOLS.some(s => s.id === tool) ? tool === t.id : lastShapeTool === t.id} Icon={t.Icon} label={t.label} grid onClick={() => { choosePopoverTool(t.id); }} />
+                  <label className="shape-library-search">
+                    <Search size={14} aria-hidden="true" />
+                    <input type="search" value={shapeSearch} aria-label="Search shapes" placeholder="Search shapes"
+                      onChange={e => setShapeSearch(e.target.value)} />
+                  </label>
+                  <nav className="shape-library-categories" aria-label="Shape categories">
+                    {SHAPE_CATEGORIES.map(category => (
+                      <button key={category} type="button" className={`shape-category-button${!shapeSearchNeedle && shapeCategory === category ? ' active' : ''}`}
+                        aria-pressed={!shapeSearchNeedle && shapeCategory === category}
+                        onClick={() => { setShapeCategory(category); setShapeSearch(''); }} title={category}>
+                        {category}
+                      </button>
                     ))}
+                  </nav>
+                  <div className="tool-popover-heading shape-library-heading" aria-live="polite">
+                    {shapeSearchNeedle ? `Search results (${visibleShapeTools.length})` : `${shapeCategory} (${visibleShapeTools.length})`}
                   </div>
-                  <div className="tool-popover-heading additional-shapes-heading">Polygons</div>
-                  <div className="shape-option-grid">
-                    {ADDITIONAL_SHAPE_TOOLS.map(t => (
-                      <PopoverItem key={t.id} active={SHAPE_TOOLS.some(s => s.id === tool) ? tool === t.id : lastShapeTool === t.id} Icon={t.Icon} label={t.label} grid onClick={() => { choosePopoverTool(t.id); }} />
-                    ))}
-                  </div>
+                  {visibleShapeTools.length ? (
+                    <div className="shape-option-grid">
+                      {visibleShapeTools.map(({ id, label, definition }) => (
+                        <PopoverItem key={id} active={SHAPE_TOOLS.some(s => s.id === tool) ? tool === id : lastShapeTool === id}
+                          preview={<ShapePreview definition={definition} size={24} />} label={label}
+                          shapeId={definition.id} grid={true} solid3d={Boolean(definition.solid3d)} onClick={() => choosePopoverTool(id)} />
+                      ))}
+                    </div>
+                  ) : <div className="shape-library-empty">No matching shapes.</div>}
                 </div>
               )}
             </div>
@@ -847,8 +1067,9 @@ export default function App() {
           {/* Text, sticky-note, and source-code editing overlays */}
           {editShape && editShape.type !== 'math' && (
             <div className={`no-canvas ${editShape.type === 'code' ? 'code-editor-overlay' : ''}`}
-              style={{ position: 'fixed', zIndex: 530, left: editBox.l, top: editBox.t,
-                transform: `scale(${zoom})`, transformOrigin: '0 0' }}
+              style={{ position: 'fixed', zIndex: 530, left: editBox.l + editBox.w / 2, top: editBox.t + editBox.h / 2,
+                width: editBox.w / zoom, height: editBox.h / zoom,
+                transform: `translate(-50%, -50%) rotate(${(editShape as any).rotation ?? 0}deg) scale(${zoom})`, transformOrigin: 'center center' }}
               onPointerDown={event => event.stopPropagation()}
               onDoubleClick={event => event.stopPropagation()}
               onWheel={event => event.stopPropagation()}
@@ -926,7 +1147,7 @@ export default function App() {
                       setEditText(value);
                       const engine = engRef.current;
                       engine?.updateTextLive(editShape.id, value);
-                      if (editShape.type !== 'sticky' && engine) {
+                      if (editShape.type !== 'sticky' && !isFixedShapeLabel(editShape) && engine) {
                         const shape = editShape as any;
                         const measured = (window as any).measureTextS(value, `${shape.fs}px 'Inter','Segoe UI',sans-serif`, false, 1);
                         const width = measured.w + 40;
@@ -942,10 +1163,11 @@ export default function App() {
                     style={{
                       width: '100%', height: '100%', background: 'transparent',
                       fontSize: (editShape as any).fs, padding: 16,
-                      fontFamily: "'Inter','Segoe UI',sans-serif", color: editShape.type === 'text' ? '#000' : 'rgba(0,0,0,0.8)',
+                      fontFamily: "'Inter','Segoe UI',sans-serif", color: isFixedShapeLabel(editShape) ? ((editShape as any).textColor ?? '#1f2937') : editShape.type === 'text' ? '#000' : 'rgba(0,0,0,0.8)',
                       caretColor: '#3b82f6', lineHeight: 1.5, boxSizing: 'border-box', resize: 'none',
                       border: 'none', borderRadius: 0, display: 'block', whiteSpace: 'pre-wrap',
                       wordBreak: 'break-word', overflowWrap: 'break-word', overflowX: 'hidden',
+                      textAlign: isFixedShapeLabel(editShape) ? 'center' : 'left',
                       overflowY: editShape.type === 'sticky' ? 'auto' : 'hidden',
                     }}
                   />
@@ -993,12 +1215,155 @@ export default function App() {
                 className="flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] font-medium rounded-lg hover:bg-gray-50 text-gray-700 transition-colors">
                 <Palette size={13} /> Style
               </button>
+              {(selectedPropertyShape || selectedConnector) && <button ref={shapePropertiesTriggerRef} type="button"
+                aria-pressed={shapePropertiesOpen} aria-expanded={shapePropertiesOpen} aria-controls="shape-properties-panel"
+                onClick={() => setShapePropertiesOpen(open => !open)}
+                className="flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] font-medium rounded-lg hover:bg-gray-50 text-gray-700 transition-colors">
+                Properties
+              </button>}
               <div className="w-px h-4 bg-gray-200" />
               <button onClick={() => engRef.current?.deleteSel()}
                 className="flex items-center gap-1.5 px-2.5 py-1.5 text-[12px] font-medium rounded-lg hover:bg-red-50 text-red-600 transition-colors">
                 <Trash2 size={12} /> Delete
               </button>
             </div>
+          )}
+
+          {shapePropertiesOpen && (selectedPropertyShape || selectedConnector) && typeof document !== 'undefined' && createPortal(
+            <aside id="shape-properties-panel" ref={shapePropertiesPanelRef} className="shape-properties-panel no-canvas panel-ui"
+              role="dialog" aria-label="Shape properties" aria-labelledby="shape-properties-title" tabIndex={-1}
+              onKeyDown={event => {
+                if (event.key !== 'Escape') return;
+                event.preventDefault();
+                event.stopPropagation();
+                closeShapeProperties(true);
+              }}
+              onPointerDown={event => event.stopPropagation()} onDoubleClick={event => event.stopPropagation()}
+              style={{ position: 'fixed', zIndex: 1800 }}>
+              <div className="shape-properties-header">
+                <div><strong id="shape-properties-title">{selectedDefinition?.label ?? 'Connector'} properties</strong><span>{selectedDefinition?.category ?? 'Arrows & Connectors'}</span></div>
+                <button type="button" onClick={() => closeShapeProperties(true)} aria-label="Close shape properties"><X size={15} /></button>
+              </div>
+              <div className="shape-properties-body">
+                {selectedPropertyShape && selectedDefinition && <>
+                  <label className="shape-property-field"><span>Name / label</span>
+                    <input value={selectedPropertyText} aria-label="Shape name or label"
+                      onChange={event => engRef.current?.updateTextLive(selectedPropertyShape.id, event.target.value)}
+                      onBlur={event => engRef.current?.updateText(selectedPropertyShape.id, event.target.value)} />
+                  </label>
+
+                  {(selectedDefinition.parameterMetadata ?? []).some(parameter => parameter.status === 'user-editable' && parameter.control)
+                    && <section className="shape-property-section shape-parameter-section" data-shape-parameter-editor>
+                      <h4>{selectedDefinition.solid3d ? '3D projection & parameters' : 'Shape parameters'}</h4>
+                      {selectedDefinition.solid3d && <p>Use the X/Y/Z rotation fields to rotate the actual local 3D model. Orientation, local dimensions, and planar board rotation stay independent.</p>}
+                      {(selectedDefinition.parameterMetadata ?? []).filter(parameter => parameter.status === 'user-editable' && parameter.control)
+                        .map(parameter => <ShapeParameterField key={parameter.key} parameter={parameter}
+                          value={(selectedPropertyParams[parameter.key] ?? parameter.defaultValue) as ShapeParameterValue}
+                          onUpdate={(key, value, commit) => engRef.current?.updateShapeParameters(selectedPropertyShape.id, { [key]: value }, commit)} />)}
+                    </section>}
+
+                  {selectedDiagram && selectedDefinition.solid3d && selectedSolidScale && <SolidDimensionFields shapeId={selectedDiagram.id}
+                    scale={selectedSolidScale}
+                    onUpdate={(axis, value, commit) => engRef.current?.updateShapeScale3d(selectedDiagram.id, { [axis]: value }, commit)} />}
+
+                  {selectedDefinition.dataCapabilities?.includes('classifier') && classifierCompartments.length > 0 && <section className="shape-property-section">
+                    <h4>Classifier compartments</h4>
+                    {classifierCompartments.map((compartment, index) => <label className="shape-property-field" key={compartment.id ?? index}>
+                      <span>{compartment.label ?? `Compartment ${index + 1}`} · one item per line</span>
+                      <textarea value={(compartment.items ?? []).join('\n')} rows={3}
+                        onChange={event => updateClassifierData(classifierCompartments.map((item, itemIndex) => itemIndex === index
+                          ? { ...item, items: event.target.value.split('\n').slice(0, 20) } : item), false)}
+                        onBlur={() => updateClassifierData(classifierCompartments, true)} />
+                    </label>)}
+                  </section>}
+
+                  {selectedDefinition.dataCapabilities?.includes('column') && columnModel && <section className="shape-property-section">
+                    <h4>Database column</h4>
+                    <label className="shape-property-field"><span>Column name</span>
+                      <input aria-label="Database column name" value={columnModel.name ?? ''}
+                        onChange={event => updateColumnData({ ...columnModel, name: event.target.value }, false)}
+                        onBlur={() => updateColumnData(columnModel, true)} />
+                    </label>
+                    <label className="shape-property-field"><span>Data type</span>
+                      <input aria-label="Database column type" value={columnModel.type ?? ''}
+                        onChange={event => updateColumnData({ ...columnModel, type: event.target.value }, false)}
+                        onBlur={() => updateColumnData(columnModel, true)} />
+                    </label>
+                    <label className="shape-property-field"><span>Key type</span><select aria-label="Database column key type"
+                      value={columnModel.key ?? 'none'} onChange={event => updateColumnData({ ...columnModel, key: event.target.value }, true)}>
+                      <option value="none">No key</option><option value="primary">Primary key</option><option value="foreign">Foreign key</option>
+                    </select></label>
+                  </section>}
+
+                  {selectedDefinition.dataCapabilities?.includes('table') && Array.isArray(tableModel?.columns) && <section className="shape-property-section">
+                    <h4>Table columns</h4>
+                    {tableColumns.map((column, index) => <div className="shape-property-column" key={column.id ?? index}>
+                      <div className="shape-property-column-fields">
+                        <input aria-label={`Column ${index + 1} name`} value={column.name ?? ''} placeholder="column name"
+                          onChange={event => updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? { ...item, name: event.target.value } : item), false)}
+                          onBlur={() => updateTableData(tableColumns, true)} />
+                        <input aria-label={`Column ${index + 1} type`} value={column.type ?? ''} placeholder="type"
+                          onChange={event => updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? { ...item, type: event.target.value } : item), false)}
+                          onBlur={() => updateTableData(tableColumns, true)} />
+                        <select aria-label={`Column ${index + 1} key type`} value={column.key ?? 'none'}
+                          onChange={event => updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? { ...item, key: event.target.value } : item), true)}>
+                          <option value="none">No key</option><option value="primary">Primary key</option><option value="foreign">Foreign key</option>
+                        </select>
+                      </div>
+                      <button type="button" onClick={() => updateTableData(tableColumns.filter((_, itemIndex) => itemIndex !== index), true)}
+                        aria-label={`Remove column ${index + 1}`} title="Remove column"><X size={13} /></button>
+                    </div>)}
+                    <button type="button" className="shape-property-add" onClick={() => updateTableData([...tableColumns, {
+                      id: `column-${Date.now()}`, name: `column_${tableColumns.length + 1}`, type: 'text', key: 'none',
+                    }], true)}>Add column</button>
+                  </section>}
+
+                </>}
+
+                {selectedConnector && <>
+                  <label className="shape-property-field"><span>Connector label</span><input value={selectedConnector.label ?? ''} placeholder="Relationship or flow label"
+                    onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { label: event.target.value }, false)}
+                    onBlur={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { label: event.target.value }, true)} /></label>
+                  <label className="shape-property-field"><span>Line style</span><select value={selectedConnector.lineStyle}
+                    onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { lineStyle: event.target.value as StrokeStyle })}>
+                    <option value="solid">Solid</option><option value="dashed">Dashed</option><option value="dotted">Dotted</option>
+                  </select></label>
+                  <div className="shape-property-grid-two">
+                    <label className="shape-property-field"><span>Start marker</span><select value={selectedConnector.startMarker}
+                      onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { startMarker: event.target.value as EndpointMarker })}>
+                      <option value="none">None</option><option value="arrow">Arrow</option><option value="openArrow">Open arrow</option><option value="hollowTriangle">Hollow triangle</option>
+                      <option value="diamond">Hollow diamond</option><option value="filledDiamond">Filled diamond</option><option value="circle">Circle</option><option value="bar">Bar</option><option value="crowFoot">Crow's foot</option>
+                    </select></label>
+                    <label className="shape-property-field"><span>End marker</span><select value={selectedConnector.endMarker}
+                      onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { endMarker: event.target.value as EndpointMarker })}>
+                      <option value="none">None</option><option value="arrow">Arrow</option><option value="openArrow">Open arrow</option><option value="hollowTriangle">Hollow triangle</option>
+                      <option value="diamond">Hollow diamond</option><option value="filledDiamond">Filled diamond</option><option value="circle">Circle</option><option value="bar">Bar</option><option value="crowFoot">Crow's foot</option>
+                    </select></label>
+                  </div>
+                  <div className="shape-property-grid-two">
+                    <label className="shape-property-field"><span>Source cardinality</span><select value={selectedConnector.sourceCardinality ?? ''}
+                      onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { sourceCardinality: (event.target.value || undefined) as Cardinality | undefined })}>
+                      <option value="">Not set</option><option value="one">One</option><option value="zero-or-one">Zero or one</option><option value="many">Many</option><option value="one-or-many">One or many</option><option value="zero-or-many">Zero or many</option>
+                    </select></label>
+                    <label className="shape-property-field"><span>Target cardinality</span><select value={selectedConnector.targetCardinality ?? ''}
+                      onChange={event => engRef.current?.updateConnectorProperties(selectedConnector.id, { targetCardinality: (event.target.value || undefined) as Cardinality | undefined })}>
+                      <option value="">Not set</option><option value="one">One</option><option value="zero-or-one">Zero or one</option><option value="many">Many</option><option value="one-or-many">One or many</option><option value="zero-or-many">Zero or many</option>
+                    </select></label>
+                  </div>
+                  <section className="shape-property-section">
+                    <h4>Connector route</h4>
+                    <p>{selectedConnector.waypoints.length} waypoint{selectedConnector.waypoints.length === 1 ? '' : 's'} · drag route handles to edit</p>
+                    <button type="button" className="shape-property-add" onClick={() => {
+                      const route = getConnectorRoute(selectedConnector), midpoint = route[Math.floor(route.length / 2)] ?? [selectedConnector.x1, selectedConnector.y1];
+                      engRef.current?.addConnectorWaypoint(selectedConnector.id, midpoint[0], midpoint[1]);
+                    }}>Add waypoint</button>
+                    {selectedConnector.waypoints.map((_, index) => <button key={index} type="button" className="shape-property-remove-waypoint"
+                      onClick={() => engRef.current?.removeConnectorWaypoint(selectedConnector.id, index)}>Remove waypoint {index + 1}</button>)}
+                  </section>
+                </>}
+              </div>
+            </aside>,
+            document.body
           )}
 
           {/* Canvas HUD: responsive groups keep controls from overlapping the board edge. */}
