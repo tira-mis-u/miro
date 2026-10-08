@@ -16,7 +16,7 @@ import { buildConnectorPreviewGeometry } from './engine/shapes/connectors';
 import { SHAPE_CATEGORIES } from './engine/shapes/types';
 import type { Cardinality, EndpointMarker, ShapeCategory, ShapeDefinition, ShapeParameterMetadata, ShapeParameterValue, StrokeStyle } from './engine/shapes/types';
 import { searchShapeDefinitions } from './engine/shapes/search';
-import { solid3DScaleFromBounds, type Solid3DScale } from './engine/shapes/solid3d';
+import { solid3DLocalAxisSpans, solid3DLocalDimensions, solid3DScaleFromBounds, solid3DSizeSemantics, type Solid3DGeometry, type Solid3DScale } from './engine/shapes/solid3d';
 import { getCanvasShortcutAction } from './engine/keyboardShortcuts';
 import {
   continueWithoutLocalRecovery, getBoardRuntimeStatus, initializeBoardStore, yShapes,
@@ -26,6 +26,7 @@ import FormulaEditor from './formula/FormulaEditor';
 import FormulaEditorBoundary from './formula/FormulaEditorBoundary';
 import { DEFAULT_CODE_LANGUAGE, normalizeCodeLanguage, type CodeLanguage } from './code/languages';
 import { HIGH_CONTRAST_CURSORS, visibleCursor } from './cursors';
+import type { LucideIcon } from 'lucide-react';
 
 const CodeEditor = React.lazy(() => import('./code/CodeEditor'));
 
@@ -33,12 +34,67 @@ const CodeEditor = React.lazy(() => import('./code/CodeEditor'));
 const PALETTE = ['#000000', '#f9a8d4', '#ef4444', '#f97316', '#22c55e', '#3b82f6', '#a855f7'];
 const STICKY_COLORS = ['#fde047', '#fca5a5', '#fdba74', '#86efac', '#93c5fd', '#d8b4fe'];
 
-const SELECT_TOOLS: { id: ToolType; Icon: React.FC<any>; label: string }[] = [
+type PositionedShape = Extract<AnyShape, { x: number; y: number; w: number; h: number }>;
+
+function isPositionedShape(shape: AnyShape): shape is PositionedShape {
+  return 'x' in shape && 'y' in shape && 'w' in shape && 'h' in shape;
+}
+
+function shapeRotation(shape: AnyShape): number {
+  return 'rotation' in shape && typeof shape.rotation === 'number' ? shape.rotation : 0;
+}
+
+function shapeFontSize(shape: AnyShape): number {
+  return 'fs' in shape && typeof shape.fs === 'number' ? shape.fs : 14;
+}
+
+function shapeTextColor(shape: AnyShape): string {
+  return 'textColor' in shape && typeof shape.textColor === 'string' ? shape.textColor : '#1f2937';
+}
+
+function measureCanvasText(text: string, font: string, isCode = false, currentZoom = 1): { w: number; h: number } {
+  const mirror = document.createElement('div');
+  mirror.style.position = 'absolute';
+  mirror.style.visibility = 'hidden';
+  mirror.style.whiteSpace = 'pre';
+  mirror.style.font = font;
+  mirror.style.padding = '0';
+  mirror.style.lineHeight = '1.5';
+  mirror.style.boxSizing = 'border-box';
+  mirror.style.width = 'max-content';
+  mirror.style.wordBreak = 'break-word';
+  mirror.style.overflowWrap = 'break-word';
+  mirror.innerText = text || ' ';
+  document.body.appendChild(mirror);
+  try {
+    let rect = mirror.getBoundingClientRect();
+    let w = Math.max(20, rect.width) + 12;
+    const maxWidth = (isCode ? 600 - 62 : 600 - 40) * currentZoom;
+    if (w > maxWidth) {
+      mirror.style.whiteSpace = 'pre-wrap';
+      mirror.style.width = `${maxWidth}px`;
+      rect = mirror.getBoundingClientRect();
+      w = maxWidth;
+    }
+    return { w, h: Math.max(20, rect.height) };
+  } finally {
+    mirror.remove();
+  }
+}
+
+const HUD_UTILITY_TOOLS: ReadonlyArray<{ label: string; Icon: LucideIcon }> = [
+  { label: 'Timer', Icon: Timer },
+  { label: 'Video', Icon: Video },
+  { label: 'Comments', Icon: MessageSquare },
+  { label: 'More', Icon: MoreHorizontal },
+];
+
+const SELECT_TOOLS: { id: ToolType; Icon: LucideIcon; label: string }[] = [
   { id: 'select', Icon: MousePointer2, label: 'Select' },
   { id: 'lasso-select', Icon: MousePointer2, label: 'Lasso Select' }, // Reuse icon for now
 ];
 
-const TEXT_TOOLS: { id: ToolType; Icon: React.FC<any>; label: string }[] = [
+const TEXT_TOOLS: { id: ToolType; Icon: LucideIcon; label: string }[] = [
   { id: 'text', Icon: Type, label: 'Text' },
   { id: 'math', Icon: Calculator, label: 'Math LaTeX' },
   { id: 'code', Icon: Code, label: 'Code Block' },
@@ -131,38 +187,90 @@ function ShapeParameterField({ parameter, value, onUpdate }: {
   </label>;
 }
 
-function SolidDimensionFields({ shapeId, scale, onUpdate }: {
+function SolidDimensionFields({ shapeId, geometry, params, scale, onUpdate }: {
   shapeId: string;
+  geometry: Solid3DGeometry;
+  params: Readonly<Record<string, unknown>>;
   scale: Solid3DScale;
   onUpdate: (axis: keyof Solid3DScale, value: number, commit: boolean) => void;
 }) {
-  const [drafts, setDrafts] = useState<Partial<Record<keyof Solid3DScale, string>>>({});
-  useEffect(() => setDrafts({}), [shapeId]);
-  const dimensions: Array<{ axis: keyof Solid3DScale; label: string }> = [
-    { axis: 'x', label: 'Local width · X' },
-    { axis: 'y', label: 'Local height · Y' },
-    { axis: 'z', label: 'Local depth · Z' },
-  ];
-  return <section className="shape-property-section" data-solid-dimensions>
-    <h4>Independent local dimensions</h4>
-    <p>Each factor scales real model geometry before local XYZ rotation. Depth/height parameters remain separate.</p>
+  const [draftState, setDraftState] = useState<{ shapeId: string; values: Partial<Record<keyof Solid3DScale, string>> }>({
+    shapeId, values: {},
+  });
+  const drafts = draftState.shapeId === shapeId ? draftState.values : {};
+  const semantics = solid3DSizeSemantics(geometry);
+  const spans = solid3DLocalAxisSpans(geometry, params);
+  const dimensions = solid3DLocalDimensions(geometry, params, scale);
+  const isotropic = semantics === 'isotropic';
+  const circular = semantics === 'radial-xy';
+  const regularBase = semantics === 'regular-base-xy';
+  const cuboid = geometry === 'cuboid3d';
+  const prism = ['triangularPrism3d', 'quadrilateralPrism3d', 'squarePrism3d',
+    'pentagonalPrism3d', 'hexagonalPrism3d'].includes(geometry);
+  const triangularPrism = geometry === 'triangularPrism3d';
+  const factorField = isotropic && geometry !== 'cube3d' && geometry !== 'sphere3d';
+  const fields: Array<{ axis: keyof Solid3DScale; label: string }> = isotropic
+    ? [{ axis: 'x', label: geometry === 'cube3d' ? 'Equal edge length' : geometry === 'sphere3d' ? 'Diameter · X/Y/Z' : 'Uniform model scale' }]
+    : circular
+      ? [{ axis: 'x', label: 'Diameter · X/Y' }, { axis: 'z', label: 'Axial dimension · Z' }]
+      : regularBase
+        ? [{ axis: 'x', label: prism ? 'Base scale · X/Y' : 'Base span · X/Y' },
+          { axis: 'z', label: prism ? 'Prism length · Z' : 'Height · Z' }]
+        : triangularPrism
+          ? [{ axis: 'x', label: 'Base width · X' }, { axis: 'y', label: 'Base height · Y' },
+            { axis: 'z', label: 'Prism length · Z' }]
+          : prism
+            ? [{ axis: 'x', label: 'Base width · X' }, { axis: 'y', label: 'Base depth · Y' },
+              { axis: 'z', label: 'Prism length · Z' }]
+            : [{ axis: 'x', label: cuboid ? 'Width · X' : 'Local dimension · X' },
+              { axis: 'y', label: cuboid ? 'Depth · Y' : 'Local dimension · Y' },
+              { axis: 'z', label: cuboid ? 'Height · Z' : 'Local dimension · Z' }];
+  const valueFor = (axis: keyof Solid3DScale) => factorField ? scale[axis] : dimensions[axis];
+  const spanFor = (axis: keyof Solid3DScale) => spans[axis === 'x' ? 0 : axis === 'y' ? 1 : 2];
+  const heading = cuboid ? 'Independent local dimensions' : isotropic ? 'Isotropic dimension policy'
+    : circular ? 'Radial XY with axial Z' : triangularPrism ? 'Triangular prism dimensions'
+      : regularBase ? prism ? 'Regular base XY + length Z' : 'Regular base XY with height Z'
+        : prism ? 'Independent prism dimensions' : 'Independent local dimensions';
+  const explanation = cuboid
+    ? 'X is width, Y is depth, and Z is height. Each local dimension can change independently; the projected selection frame follows the 3D model.'
+    : geometry === 'cube3d' ? 'Cube edits preserve one equal edge on all three local axes.'
+      : geometry === 'sphere3d' ? 'Sphere edits preserve equal X/Y/Z diameters; resize never turns it into an ellipsoid.'
+        : geometry === 'tetrahedron3d' || geometry === 'octahedron3d'
+          ? 'One uniform scale preserves the regular solid. Its internal depth is fixed to the mathematical default.'
+          : circular ? 'The revolved radius is shared by X and Y; Z changes only the axial height.'
+            : triangularPrism ? 'X is triangular-base width, Y is base height, and Z is prism length; the congruent XY bases are separated along Z.'
+              : regularBase ? prism ? 'The regular polygon base keeps a shared X/Y scale; Z changes prism length.'
+                : 'The regular base remains coherent across X/Y; Z changes the pyramid height.'
+                : prism ? 'X and Y map to the irregular base dimensions, and Z is the actual prism extrusion.'
+                  : 'Dimensions follow the actual local mesh axes. Projected screen bounds are derived, not used as the size solver.';
+  return <section className="shape-property-section" data-solid-dimensions data-solid-geometry={geometry}>
+    <h4>{heading}</h4>
+    <p>{explanation}</p>
     <div className="shape-property-grid-two">
-      {dimensions.map(({ axis, label }) => <label className="shape-property-field" key={axis}>
-        <span>{label} · {scale[axis].toFixed(2)}×</span>
-        <input type="number" min="0.01" max="64" step="0.01" value={drafts[axis] ?? scale[axis].toFixed(2)}
-          aria-label={`${label} scale`} data-solid-scale-key={axis}
-          onChange={event => {
-            const raw = event.target.value;
-            setDrafts(previous => ({ ...previous, [axis]: raw }));
-            if (raw.trim() && Number.isFinite(Number(raw))) onUpdate(axis, Number(raw), false);
-          }}
-          onBlur={event => {
-            const raw = drafts[axis] ?? event.currentTarget.value;
-            if (raw.trim() && Number.isFinite(Number(raw))) onUpdate(axis, Number(raw), true);
-            setDrafts(previous => ({ ...previous, [axis]: undefined }));
-          }}
-          onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }} />
-      </label>)}
+      {fields.map(({ axis, label }) => {
+        const value = valueFor(axis);
+        const factor = factorField ? 1 : spanFor(axis);
+        const min = factorField ? 0.01 : Math.max(0.001, factor * 0.01);
+        const max = factorField ? 64 : Math.max(min, factor * 64);
+        const formatted = value.toFixed(2);
+        return <label className="shape-property-field" key={axis}>
+          <span>{label}{factorField ? ` · ${scale[axis].toFixed(2)}×` : ` · ${formatted} units`}</span>
+          <input type="number" min={min} max={max} step="0.01" value={drafts[axis] ?? formatted}
+            aria-label={`${label} ${factorField ? 'scale' : 'dimension'}`} data-solid-scale-key={axis}
+            data-solid-dimension-key={axis}
+            onChange={event => {
+              const raw = event.target.value;
+              setDraftState(previous => ({ shapeId, values: { ...(previous.shapeId === shapeId ? previous.values : {}), [axis]: raw } }));
+              if (raw.trim() && Number.isFinite(Number(raw))) onUpdate(axis, Number(raw), false);
+            }}
+            onBlur={event => {
+              const raw = drafts[axis] ?? event.currentTarget.value;
+              if (raw.trim() && Number.isFinite(Number(raw))) onUpdate(axis, Number(raw), true);
+              setDraftState(previous => ({ shapeId, values: { ...(previous.shapeId === shapeId ? previous.values : {}), [axis]: undefined } }));
+            }}
+            onKeyDown={event => { if (event.key === 'Enter') event.currentTarget.blur(); }} />
+        </label>;
+      })}
     </div>
   </section>;
 }
@@ -172,7 +280,7 @@ type PopoverGroup = 'pen' | 'shapes' | 'text' | 'select';
 // Math symbols và auto-replace đã được chuyển sang formula/parser.ts
 // MATH_SYMBOLS và AUTO_REPLACE không còn cần ở đây
 
-function PopoverItem({ active, onClick, Icon, preview, label, grid, shapeId, solid3d }: { active: boolean; onClick: (e: React.MouseEvent) => void; Icon?: any; preview?: React.ReactNode; label: string; grid?: boolean; shapeId?: string; solid3d?: boolean }) {
+function PopoverItem({ active, onClick, Icon, preview, label, grid, shapeId, solid3d }: { active: boolean; onClick: (e: React.MouseEvent) => void; Icon?: LucideIcon; preview?: React.ReactNode; label: string; grid?: boolean; shapeId?: string; solid3d?: boolean }) {
   return (
     <button type="button" onClick={onClick} title={label} aria-label={label} aria-pressed={active}
       {...(shapeId ? { 'data-shape-id': shapeId } : {})}
@@ -249,6 +357,35 @@ export default function App() {
   const [editLanguage, setEditLanguage] = useState<CodeLanguage>(DEFAULT_CODE_LANGUAGE);
   const [editBox, setEditBox] = useState({ l: 0, t: 0, w: 0, h: 0 });
   const [editClick, setEditClick] = useState({ x: 0, y: 0 });
+  const [canvasMetrics, setCanvasMetrics] = useState({ w: 0, h: 0, left: 0, top: 0 });
+  const textFocusShapeIdRef = useRef<string | null>(null);
+
+  useLayoutEffect(() => {
+    const measureCanvas = () => {
+      const wrap = wrapRef.current;
+      const canvas = canvasRef.current;
+      if (!wrap || !canvas) return;
+      const rect = canvas.getBoundingClientRect();
+      const next = { w: wrap.clientWidth, h: wrap.clientHeight, left: rect.left, top: rect.top };
+      setCanvasMetrics(previous => previous.w === next.w && previous.h === next.h
+        && previous.left === next.left && previous.top === next.top ? previous : next);
+    };
+    measureCanvas();
+    const wrap = wrapRef.current;
+    const observer = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(measureCanvas) : null;
+    if (wrap) observer?.observe(wrap);
+    window.addEventListener('resize', measureCanvas, { passive: true });
+    window.addEventListener('scroll', measureCanvas, true);
+    window.visualViewport?.addEventListener('resize', measureCanvas);
+    window.visualViewport?.addEventListener('scroll', measureCanvas);
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', measureCanvas);
+      window.removeEventListener('scroll', measureCanvas, true);
+      window.visualViewport?.removeEventListener('resize', measureCanvas);
+      window.visualViewport?.removeEventListener('scroll', measureCanvas);
+    };
+  }, []);
 
   // style panel
   const [panelOpen, setPanelOpen] = useState(false);
@@ -262,7 +399,9 @@ export default function App() {
   const [stickyBg, setStickyBg] = useState('#fef08a');
   const [fontSize, setFontSize] = useState(14);
   const engineStyleRef = useRef({ penColor, penSize, fill, stroke, sw, stickyBg, fontSize });
-  engineStyleRef.current = { penColor, penSize, fill, stroke, sw, stickyBg, fontSize };
+  useLayoutEffect(() => {
+    engineStyleRef.current = { penColor, penSize, fill, stroke, sw, stickyBg, fontSize };
+  }, [penColor, penSize, fill, stroke, sw, stickyBg, fontSize]);
 
   const [openGroup, setOpenGroup] = useState<PopoverGroup | null>(null);
   const [penMode, setPenMode] = useState<'normal' | 'smart'>('normal');
@@ -401,10 +540,7 @@ export default function App() {
   }, []);
 
   useLayoutEffect(() => {
-    if (!openGroup) {
-      setPopoverPosition(null);
-      return;
-    }
+    if (!openGroup) return;
     const anchor = popoverAnchorRefs.current[openGroup];
     const panel = popoverPanelRef.current;
     if (!anchor || !panel) return;
@@ -457,8 +593,18 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    beginBoardInitialization();
-  }, [beginBoardInitialization]);
+    let active = true;
+    void initializeBoardStore().then(() => {
+      if (!active) return;
+      setBoardRestoreError(null);
+      setBoardReady(true);
+    }).catch(error => {
+      if (!active) return;
+      const status = getBoardRuntimeStatus();
+      setBoardRestoreError(status.message || (error instanceof Error ? error.message : String(error)));
+    });
+    return () => { active = false; };
+  }, []);
 
   // ── init engine only after local content has been restored ─────────────
   useEffect(() => {
@@ -486,84 +632,49 @@ export default function App() {
     eng.onTool = t => setToolSt(t);
 
     eng.onCam = cam => {
-      if (editShapeRef.current && 'x' in editShapeRef.current) {
-        const s = editShapeRef.current as any;
-        const sp = eng.worldToClient(s.x, s.y);
-        setEditBox(prev => ({
-          ...prev, l: sp.x, t: sp.y,
-          w: s.w * cam.zoom, h: s.h * cam.zoom
-        }));
-      }
+      const editingShape = editShapeRef.current;
+      if (!editingShape || !isPositionedShape(editingShape)) return;
+      const sp = eng.worldToClient(editingShape.x, editingShape.y);
+      setEditBox(prev => ({
+        ...prev, l: sp.x, t: sp.y,
+        w: editingShape.w * cam.zoom, h: editingShape.h * cam.zoom,
+      }));
     };
 
-    eng.onShapeUpdate = s => {
-      if (eng.sel.has(s.id)) setSelectedShape(s);
-      if (editShapeRef.current?.id !== s.id) return;
-      const updated = s as any;
-      if (typeof updated.text === 'string') {
-        editTextRef.current = updated.text;
-        if (updated.type !== 'math') setEditText(current => current === updated.text ? current : updated.text);
+    eng.onShapeUpdate = shape => {
+      if (eng.sel.has(shape.id)) setSelectedShape(shape);
+      if (editShapeRef.current?.id !== shape.id) return;
+      if ('text' in shape && typeof shape.text === 'string') {
+        const updatedText = shape.text;
+        editTextRef.current = updatedText;
+        if (shape.type !== 'math') setEditText(current => current === updatedText ? current : updatedText);
       }
-      if (updated.type === 'code') setEditLanguage(normalizeCodeLanguage(updated.language));
-      if ('x' in updated && 'y' in updated) {
-        const sp = eng.worldToClient(updated.x, updated.y);
-        setEditBox({ l: sp.x, t: sp.y, w: updated.w * eng.cam.zoom, h: updated.h * eng.cam.zoom });
+      if (shape.type === 'code') setEditLanguage(normalizeCodeLanguage(shape.language));
+      if (isPositionedShape(shape)) {
+        const sp = eng.worldToClient(shape.x, shape.y);
+        setEditBox({ l: sp.x, t: sp.y, w: shape.w * eng.cam.zoom, h: shape.h * eng.cam.zoom });
       }
-      internalSetEditShape(s);
+      internalSetEditShape(shape);
     };
-
-    // Global measurement helper for smart resize
-    const measureText = (text: string, font: string, isCode: boolean = false, currentZoom: number = 1) => {
-      const mirror = document.createElement('div');
-      mirror.style.position = 'absolute';
-      mirror.style.visibility = 'hidden';
-      mirror.style.whiteSpace = 'pre';
-      mirror.style.font = font;
-      mirror.style.padding = '0';
-      mirror.style.lineHeight = '1.5';
-      mirror.style.boxSizing = 'border-box';
-      mirror.style.width = 'max-content';
-      mirror.style.wordBreak = 'break-word';
-      mirror.style.overflowWrap = 'break-word';
-      mirror.innerText = text || ' ';
-      document.body.appendChild(mirror);
-
-      let rect = mirror.getBoundingClientRect();
-      let w = Math.max(20, rect.width) + 12; // 12px extra buffer space prevents aggressive inner early text-wrapping
-
-      const MAX_W = (isCode ? 600 - 62 : 600 - 40) * currentZoom;
-      if (w > MAX_W) {
-        mirror.style.whiteSpace = 'pre-wrap';
-        mirror.style.width = MAX_W + 'px';
-        rect = mirror.getBoundingClientRect();
-        w = MAX_W;
-      }
-
-      const h = Math.max(20, rect.height);
-      document.body.removeChild(mirror);
-      return { w, h };
-    };
-    (window as any).measureTextS = measureText;
 
     eng.onEditText = (shape: AnyShape, cx: number, cy: number) => {
+      if (!isPositionedShape(shape)) return;
       eng.setEditingId(shape.id);
-      const s = shape as any;
-      const sp = eng.worldToClient(s.x, s.y);
+      const sp = eng.worldToClient(shape.x, shape.y);
+      const text = 'text' in shape && typeof shape.text === 'string' ? shape.text : '';
 
-      const l = sp.x, t = sp.y;
       // Precision positioning handled by FormulaEditor's world-coordinate internal logic.
       // We pass the raw sp coordinates here as the anchor.
-
       setEditBox({
-        l, t,
-        w: s.w * eng.cam.zoom,
-        h: s.h * eng.cam.zoom,
+        l: sp.x, t: sp.y,
+        w: shape.w * eng.cam.zoom,
+        h: shape.h * eng.cam.zoom,
       });
       setEditClick({ x: cx, y: cy });
       internalSetEditShape(shape);
-      editTextRef.current = s.text || '';
-      setEditText(s.text || '');
-      setEditLanguage(normalizeCodeLanguage(s.language));
+      editTextRef.current = text;
+      setEditText(text);
+      setEditLanguage(normalizeCodeLanguage(shape.type === 'code' ? shape.language : undefined));
     };
 
     // Global click listener to close popovers when hitting board/outside
@@ -633,23 +744,12 @@ export default function App() {
 
   // re-position edit overlay when zoom changes
   useEffect(() => {
-    if (!editShape || !engRef.current) return;
+    if (!editShape || !isPositionedShape(editShape) || !engRef.current) return;
     const eng = engRef.current;
-    const s = editShape as any;
-    const sp = eng.worldToClient(s.x, s.y);
-    const sw = s.w * eng.cam.zoom;
-    const sh = s.h * eng.cam.zoom;
-
-    // For math shapes, the editor should appear EXACTLY at the shape position (where the user clicks)
-    if (s.type === 'math') {
-      setEditBox({
-        l: sp.x,
-        t: sp.y,
-        w: sw, h: sh
-      });
-    } else {
-      setEditBox({ l: sp.x, t: sp.y, w: sw, h: sh });
-    }
+    const sp = eng.worldToClient(editShape.x, editShape.y);
+    const sw = editShape.w * eng.cam.zoom;
+    const sh = editShape.h * eng.cam.zoom;
+    setEditBox({ l: sp.x, t: sp.y, w: sw, h: sh });
   }, [zoom, editShape]);
 
   const handleFormulaSourceChange = useCallback((source: string, lastValidPreview?: string) => {
@@ -780,7 +880,7 @@ export default function App() {
   const selectedPropertyShape = selectedDiagram ?? (selectedLegacyDefinition ? selectedShape : null);
   const selectedDefinition = selectedDiagram ? getShapeDefinition(selectedDiagram.shapeId) : selectedLegacyDefinition;
   const selectedSolidScale = selectedDiagram && selectedDefinition?.solid3d
-    ? selectedDiagram.scale3d ?? solid3DScaleFromBounds(selectedDiagram.w, selectedDiagram.h, selectedDefinition.width,
+    ? selectedDiagram.scale3d ?? selectedDefinition.defaultScale3d ?? solid3DScaleFromBounds(selectedDiagram.w, selectedDiagram.h, selectedDefinition.width,
       selectedDefinition.height, selectedDefinition.geometry as import('./engine/shapes/solid3d').Solid3DGeometry)
     : null;
   const selectedPropertyParams = selectedPropertyShape && 'params' in selectedPropertyShape ? selectedPropertyShape.params ?? {} : {};
@@ -1069,7 +1169,7 @@ export default function App() {
             <div className={`no-canvas ${editShape.type === 'code' ? 'code-editor-overlay' : ''}`}
               style={{ position: 'fixed', zIndex: 530, left: editBox.l + editBox.w / 2, top: editBox.t + editBox.h / 2,
                 width: editBox.w / zoom, height: editBox.h / zoom,
-                transform: `translate(-50%, -50%) rotate(${(editShape as any).rotation ?? 0}deg) scale(${zoom})`, transformOrigin: 'center center' }}
+                transform: `translate(-50%, -50%) rotate(${shapeRotation(editShape)}deg) scale(${zoom})`, transformOrigin: 'center center' }}
               onPointerDown={event => event.stopPropagation()}
               onDoubleClick={event => event.stopPropagation()}
               onWheel={event => event.stopPropagation()}
@@ -1125,10 +1225,10 @@ export default function App() {
                     className="board-text-editor"
                     aria-label={`Edit ${editShape.type} content`}
                     ref={element => {
-                      if (!element || (element as any)._initFocus === editShape.id) return;
-                      (element as any)._initFocus = editShape.id;
+                      if (!element || textFocusShapeIdRef.current === editShape.id) return;
+                      textFocusShapeIdRef.current = editShape.id;
                       element.focus();
-                      const fs = (editShape as any).fs || 14;
+                      const fs = shapeFontSize(editShape);
                       const charWidth = fs * 0.5;
                       const lineHeight = 1.5 * fs;
                       const dx = (editClick.x - editBox.l) / zoom - 16;
@@ -1148,8 +1248,8 @@ export default function App() {
                       const engine = engRef.current;
                       engine?.updateTextLive(editShape.id, value);
                       if (editShape.type !== 'sticky' && !isFixedShapeLabel(editShape) && engine) {
-                        const shape = editShape as any;
-                        const measured = (window as any).measureTextS(value, `${shape.fs}px 'Inter','Segoe UI',sans-serif`, false, 1);
+                        const fs = shapeFontSize(editShape);
+                        const measured = measureCanvasText(value, `${fs}px 'Inter','Segoe UI',sans-serif`, false, 1);
                         const width = measured.w + 40;
                         const height = measured.h + 40;
                         setEditBox(previous => ({ ...previous, w: width * zoom, h: height * zoom }));
@@ -1162,8 +1262,8 @@ export default function App() {
                     }}
                     style={{
                       width: '100%', height: '100%', background: 'transparent',
-                      fontSize: (editShape as any).fs, padding: 16,
-                      fontFamily: "'Inter','Segoe UI',sans-serif", color: isFixedShapeLabel(editShape) ? ((editShape as any).textColor ?? '#1f2937') : editShape.type === 'text' ? '#000' : 'rgba(0,0,0,0.8)',
+                      fontSize: shapeFontSize(editShape), padding: 16,
+                      fontFamily: "'Inter','Segoe UI',sans-serif", color: isFixedShapeLabel(editShape) ? shapeTextColor(editShape) : editShape.type === 'text' ? '#000' : 'rgba(0,0,0,0.8)',
                       caretColor: '#3b82f6', lineHeight: 1.5, boxSizing: 'border-box', resize: 'none',
                       border: 'none', borderRadius: 0, display: 'block', whiteSpace: 'pre-wrap',
                       wordBreak: 'break-word', overflowWrap: 'break-word', overflowX: 'hidden',
@@ -1183,19 +1283,19 @@ export default function App() {
               <FormulaEditor
                 key={editShape.id}
                 initialText={editText}
-                initialPreviewText={(editShape as any).previewText ?? editText}
+                initialPreviewText={editShape.previewText ?? editText}
                 fontSize={formulaFontSize}
                 zoom={cam.zoom}
-                worldX={(editShape as any).x}
-                worldY={(editShape as any).y}
+                worldX={editShape.x}
+                worldY={editShape.y}
                 cam={cam}
-                view={{ w: wrapRef.current?.clientWidth || 0, h: wrapRef.current?.clientHeight || 0 }}
+                view={{ w: canvasMetrics.w, h: canvasMetrics.h }}
                 onTextChange={handleFormulaSourceChange}
                 onCommit={commitEdit}
                 onResize={resizeFormula}
                 onMove={moveFormula}
-                clickX={editClick.x !== undefined ? editClick.x - (canvasRef.current?.getBoundingClientRect().left || 0) : undefined}
-                clickY={editClick.y !== undefined ? editClick.y - (canvasRef.current?.getBoundingClientRect().top || 0) : undefined}
+                clickX={editClick.x - canvasMetrics.left}
+                clickY={editClick.y - canvasMetrics.top}
               />
             </FormulaEditorBoundary>
           )}
@@ -1263,8 +1363,18 @@ export default function App() {
                     </section>}
 
                   {selectedDiagram && selectedDefinition.solid3d && selectedSolidScale && <SolidDimensionFields shapeId={selectedDiagram.id}
-                    scale={selectedSolidScale}
-                    onUpdate={(axis, value, commit) => engRef.current?.updateShapeScale3d(selectedDiagram.id, { [axis]: value }, commit)} />}
+                    geometry={selectedDefinition.geometry as Solid3DGeometry}
+                    params={selectedDiagram.params ?? selectedDefinition.defaultParams ?? {}} scale={selectedSolidScale}
+                    onUpdate={(axis, value, commit) => {
+                      const geometry = selectedDefinition.geometry as Solid3DGeometry;
+                      const params = selectedDiagram.params ?? selectedDefinition.defaultParams ?? {};
+                      const factorField = solid3DSizeSemantics(geometry) === 'isotropic'
+                        && geometry !== 'cube3d' && geometry !== 'sphere3d';
+                      const spans = solid3DLocalAxisSpans(geometry, params);
+                      const axisIndex = axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
+                      const scaleValue = factorField ? value : value / Math.max(1e-6, spans[axisIndex]);
+                      engRef.current?.updateShapeScale3d(selectedDiagram.id, { [axis]: scaleValue }, commit);
+                    }} />}
 
                   {selectedDefinition.dataCapabilities?.includes('classifier') && classifierCompartments.length > 0 && <section className="shape-property-section">
                     <h4>Classifier compartments</h4>
@@ -1369,7 +1479,7 @@ export default function App() {
           {/* Canvas HUD: responsive groups keep controls from overlapping the board edge. */}
           <div className="canvas-hud no-canvas">
             <div className="hud-utility-cluster">
-              {[["Timer", Timer], ["Video", Video], ["Comments", MessageSquare], ["More", MoreHorizontal]].map(([label, Icon]: any) => (
+              {HUD_UTILITY_TOOLS.map(({ label, Icon }) => (
                 <button key={label} type="button" disabled title={`${label} is not available yet`} aria-label={`${label} (not available yet)`}
                   className="hud-tool-button flex items-center justify-center rounded-md text-gray-500 disabled:cursor-not-allowed">
                   <Icon size={16} strokeWidth={2} />

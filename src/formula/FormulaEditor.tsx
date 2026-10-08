@@ -94,10 +94,12 @@ export default function FormulaEditor({
   const onCommitRef = useRef(onCommit);
   const onResizeRef = useRef(onResize);
   const onASTChangeRef = useRef(onASTChange);
-  onTextChangeRef.current = onTextChange;
-  onCommitRef.current = onCommit;
-  onResizeRef.current = onResize;
-  onASTChangeRef.current = onASTChange;
+  useLayoutEffect(() => {
+    onTextChangeRef.current = onTextChange;
+    onCommitRef.current = onCommit;
+    onResizeRef.current = onResize;
+    onASTChangeRef.current = onASTChange;
+  }, [onTextChange, onCommit, onResize, onASTChange]);
 
   const safeZoom = Math.max(0.01, zoom);
   const availableView = {
@@ -440,7 +442,8 @@ export default function FormulaEditor({
   }, [screenX, screenY]);
 
   useLayoutEffect(() => {
-    repositionPanels();
+    const frame = window.requestAnimationFrame(repositionPanels);
+    return () => window.cancelAnimationFrame(frame);
   }, [repositionPanels, editorWidth, toolsWidth, maxPanelHeight, toolsMaxHeight, mode, sourceContentHeight, sourceError]);
 
   useLayoutEffect(() => {
@@ -454,7 +457,9 @@ export default function FormulaEditor({
   }, [repositionPanels]);
 
   const commitRef = useRef(commitDraft);
-  commitRef.current = commitDraft;
+  useLayoutEffect(() => {
+    commitRef.current = commitDraft;
+  }, [commitDraft]);
   useEffect(() => {
     const onPointerDown = (event: PointerEvent) => {
       const target = event.target as HTMLElement | null;

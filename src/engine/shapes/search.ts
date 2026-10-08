@@ -21,10 +21,10 @@ export interface ShapeSearchDocument {
   readonly fields: readonly ShapeSearchField[];
 }
 
-const CATEGORY_TERMS: Readonly<Record<ShapeCategory, readonly string[]>> = {
+const CATEGORY_TERMS: Readonly<Partial<Record<ShapeCategory, readonly string[]>>> = {
   Basic: ['basic shapes', 'general shapes'],
   '3D Shapes': ['3d', '3d solids', 'three dimensional', 'solid geometry'],
-  Flowchart: ['flow chart', 'process diagram', 'process mapping'],
+
   'ERD / Database': ['erd', 'database', 'entity relationship', 'entity relationship diagram', 'data modeling'],
   'Use Case Diagram': ['use case', 'use-case', 'uml use case', 'uml use-case diagram'],
   'Class Diagram': ['class diagram', 'uml class diagram', 'software class diagram'],
@@ -72,9 +72,9 @@ function searchFields(definition: ShapeDefinition): ShapeSearchField[] {
   add('category', definition.category, 5);
   for (const category of definition.pickerCategories ?? []) {
     add('category', category, 5);
-    for (const term of CATEGORY_TERMS[category]) add('category', term, 5);
+    for (const term of CATEGORY_TERMS[category] ?? []) add('category', term, 5);
   }
-  for (const term of CATEGORY_TERMS[definition.category]) add('category', term, 5);
+  for (const term of CATEGORY_TERMS[definition.category] ?? []) add('category', term, 5);
   add('notation', definition.semantic?.notation, 5);
   add('description', definition.description, 6);
   return fields;

@@ -1,7 +1,8 @@
 import { getShapeDefinition, getShapeDefinitionForLegacyType } from './registry';
 import { buildShapeGeometry, flattenGeometryCommands } from './geometry';
 import { buildConnectorRoute, CONNECTOR_LABEL_HEIGHT, CONNECTOR_LABEL_MAX_WIDTH, CONNECTOR_LABEL_PADDING_X, CONNECTOR_LABEL_PADDING_Y, connectorMarkerOccupancy, fitConnectorLabel } from './connectors';
-import { isSolid3DGeometry, solid3DScaleFromBounds } from './solid3d';
+import { isSolid3DGeometry, migrateSolid3DRotationFromYUp, migrateSolid3DScaleFromYUp,
+  normalizeSolid3DScale, solid3DScaleFromBounds, SOLID3D_POSE_VERSION } from './solid3d';
 import type { Cardinality, ConnectorShapeObject, DiagramShapeObject, EndpointMarker, ShapeConnectionPoint, ShapeDefinition, ShapeEndpointReference, ShapeResizePolicy } from './types';
 
 /** Supported pre-registry board record types. Unknown map records are retained as opaque data. */
@@ -189,13 +190,13 @@ function diagramBounds(definition: ShapeDefinition, x: number, y: number, w: num
   if (!definition.solid3d) return rotatedBoxBounds({ x, y, w, h, rotation });
   const projectionBounds = buildShapeGeometry(definition, w, h, params, {
     scale: scale3d ?? solid3DScaleFromBounds(w, h, definition.width, definition.height, definition.geometry as import('./solid3d').Solid3DGeometry),
-    referenceWidth: definition.width, referenceHeight: definition.height,
+    referenceWidth: definition.width, referenceHeight: definition.height, center: { x: 0, y: 0 },
   }).projection?.projectedBounds;
   if (!projectionBounds) return rotatedBoxBounds({ x, y, w, h, rotation });
-  const centerX = x + w / 2, centerY = y + h / 2;
+  // For a solid, x/y are the projected location of its authored local origin, not a box corner.
   const corners = [[projectionBounds.minX, projectionBounds.minY], [projectionBounds.maxX, projectionBounds.minY],
     [projectionBounds.maxX, projectionBounds.maxY], [projectionBounds.minX, projectionBounds.maxY]].map(([px, py]) =>
-    rotatePoint(x + px, y + py, centerX, centerY, rotation));
+    rotatePoint(x + px, y + py, x, y, rotation));
   const xs = corners.map(point => point[0]), ys = corners.map(point => point[1]);
   return { minX: Math.min(...xs), minY: Math.min(...ys), maxX: Math.max(...xs), maxY: Math.max(...ys) };
 }
@@ -209,29 +210,75 @@ export function deserializeBoardShape(mapKey: string, raw: unknown): Record<stri
     const definition = getShapeDefinition(raw.shapeId);
     if (!definition || definition.kind !== 'shape') return null;
     if (!finite(raw.x) || !finite(raw.y)) return null;
-    const x = raw.x, y = raw.y, w = safeSize(raw.w), h = safeSize(raw.h), rotation = normalizeRotation(raw.rotation);
+    let x = raw.x, y = raw.y;
+    const w = safeSize(raw.w), h = safeSize(raw.h), rotation = normalizeRotation(raw.rotation);
     let params: Record<string, unknown> = isObject(raw.params) ? { ...(definition.defaultParams ?? {}), ...raw.params } : { ...(definition.defaultParams ?? {}) };
     let scale3d: { x: number; y: number; z: number } | undefined;
+    let solid3dPoseVersion: number | undefined;
     if (isSolid3DGeometry(definition.geometry)) {
       const rawScale = isObject(raw.scale3d) ? raw.scale3d : null;
       const safeScale = (value: unknown) => finite(value) ? Math.max(0.01, Math.min(64, value)) : 1;
-      scale3d = rawScale
-        ? { x: safeScale(rawScale.x), y: safeScale(rawScale.y), z: safeScale(rawScale.z) }
-        : solid3DScaleFromBounds(w, h, definition.width, definition.height, definition.geometry);
-      // Persisted XYZ factors are true local dimensions. Preserve all axes independently on load;
-      // normalizing their geometric mean here would silently erase user resizing/history.
-      const defaults = definition.defaultParams ?? {};
-      if (definition.geometry === 'sphere3d' || definition.geometry === 'cube3d') {
-        // Retain one isotropic sphere radius / equal Cube edge length; old depth values must not
-        // resurrect an ellipsoid or stretch the Cube into a cuboid.
-        delete params.depth;
+      const legacyParams = isObject(raw.params) ? raw.params : {};
+      const storedPoseVersion = finite(raw.solid3dPoseVersion) ? Math.floor(raw.solid3dPoseVersion) : 0;
+      const migrateYUp = storedPoseVersion < SOLID3D_POSE_VERSION;
+      const frameScaleX = Math.max(0.01, Math.min(64, w / Math.max(1, definition.width)));
+      const frameScaleY = Math.max(0.01, Math.min(64, h / Math.max(1, definition.height)));
+      let candidateScale: { x: number; y: number; z: number };
+      if (rawScale) {
+        candidateScale = { x: safeScale(rawScale.x), y: safeScale(rawScale.y), z: safeScale(rawScale.z) };
+      } else if (migrateYUp) {
+        // Pre-v2 frame migration: old local Y was height and old local Z was inferred depth.
+        candidateScale = definition.geometry === 'tetrahedron3d'
+          ? { ...(definition.defaultScale3d ?? { x: 1, y: 1, z: 1 }) }
+          : { x: frameScaleX, y: frameScaleY, z: Math.min(frameScaleX, frameScaleY) };
       } else {
-        const depth = finite(params.depth) ? Math.max(0.15, Math.min(2.5, params.depth)) : Number(defaults.depth ?? 0.72);
-        params.depth = depth;
+        candidateScale = definition.geometry === 'tetrahedron3d'
+          ? { ...(definition.defaultScale3d ?? { x: 1, y: 1, z: 1 }) }
+          : solid3DScaleFromBounds(w, h, definition.width, definition.height, definition.geometry);
+      }
+      if (definition.geometry === 'cuboid3d' && ((!rawScale && migrateYUp)
+          || 'baseRatio' in legacyParams || 'depth' in legacyParams)) {
+        // Legacy cuboids encoded proportions a second time in parameters. Apply them in the old
+        // basis exactly once, then the v2 migration below swaps old height/depth into Z-up axes.
+        candidateScale.x *= finite(legacyParams.baseRatio) ? Math.max(0.25, Math.min(2.5, legacyParams.baseRatio)) : 1.35;
+        candidateScale.z *= finite(legacyParams.depth) ? Math.max(0.15, Math.min(2.5, legacyParams.depth)) : 0.72;
+        delete params.baseRatio;
+        delete params.depth;
+      }
+      if (migrateYUp) {
+        candidateScale = migrateSolid3DScaleFromYUp(candidateScale);
+        Object.assign(params, migrateSolid3DRotationFromYUp(params));
+        // Old pyramid offsets used local Z for the second in-plane direction; in the new
+        // right-handed XY base that coordinate is -Y. Keep an explicit new value if supplied.
+        if ('apexOffsetZ' in legacyParams && !('apexOffsetY' in legacyParams)) {
+          params.apexOffsetY = -(finite(legacyParams.apexOffsetZ) ? legacyParams.apexOffsetZ : 0);
+        }
+        // The trapezoid-only parameter has no meaning for the fixed irregular quadrilateral mesh.
+        delete params.baseInsetRatio;
+        delete params.apexOffsetZ;
+        // Old x/y stored the projected box's top-left; in v2 they store the true model origin,
+        // which was exactly the old box center. This keeps existing objects visually anchored.
+        x += w / 2;
+        y += h / 2;
+      } else {
+        delete params.baseInsetRatio;
+        delete params.apexOffsetZ;
+      }
+      scale3d = normalizeSolid3DScale(definition.geometry, candidateScale);
+      // Only persist semantic height where this definition actually owns one. In particular the
+      // tetrahedron's registered depth=1 is shared by fresh construction and reload; no generic
+      // .72 fallback is injected into shapes that do not define depth.
+      const defaults = definition.defaultParams ?? {};
+      if (definition.geometry === 'sphere3d' || definition.geometry === 'cube3d' || definition.geometry === 'cuboid3d') {
+        delete params.depth;
+      } else if ('depth' in defaults || 'depth' in params) {
+        const fallbackDepth = finite(defaults.depth) ? defaults.depth : 1;
+        params.depth = finite(params.depth) ? Math.max(0.15, Math.min(2.5, params.depth)) : fallbackDepth;
       }
       for (const axis of ['rotationX', 'rotationY', 'rotationZ'] as const) {
         params[axis] = finite(params[axis]) ? Math.max(-360, Math.min(360, params[axis] as number)) : Number(defaults[axis] ?? 0);
       }
+      solid3dPoseVersion = Math.max(SOLID3D_POSE_VERSION, storedPoseVersion);
     }
     const rawData = isObject(raw.data) ? raw.data : {};
     const data = sanitizeData({ ...(definition.defaultData ?? {}), ...rawData }) as Record<string, unknown>;
@@ -245,6 +292,7 @@ export function deserializeBoardShape(mapKey: string, raw: unknown): Record<stri
       ...(typeof raw.textColor === 'string' ? { textColor: safeColor(raw.textColor, '#1f2937') } : {}),
       params,
       ...(scale3d ? { scale3d } : {}),
+      ...(solid3dPoseVersion ? { solid3dPoseVersion } : {}),
       ...(Object.keys(data).length ? { data } : {}),
       ...(typeof raw.containerId === 'string' && raw.containerId.length <= 256 && raw.containerId !== id ? { containerId: raw.containerId } : {}),
       ...bounds,
@@ -338,9 +386,10 @@ export function connectionPointsForBox(shape: {
   shapeId?: string; type?: string; params?: Readonly<Record<string, unknown>>; scale3d?: { x: number; y: number; z: number };
 }): ShapeConnectionPoint[] {
   const definition = shape.shapeId ? getShapeDefinition(shape.shapeId) : shape.type ? getShapeDefinitionForLegacyType(shape.type) : undefined;
+  const solidOrigin = Boolean(definition?.solid3d);
   const geometry = definition ? buildShapeGeometry(definition, shape.w, shape.h, shape.params ?? definition.defaultParams ?? {},
-    definition.solid3d ? { scale: shape.scale3d ?? solid3DScaleFromBounds(shape.w, shape.h, definition.width, definition.height),
-      referenceWidth: definition.width, referenceHeight: definition.height } : undefined) : null;
+    definition.solid3d ? { scale: shape.scale3d ?? solid3DScaleFromBounds(shape.w, shape.h, definition.width, definition.height, definition.geometry as import('./solid3d').Solid3DGeometry),
+      referenceWidth: definition.width, referenceHeight: definition.height, center: { x: 0, y: 0 } } : undefined) : null;
   const paths = geometry ? [
     ...flattenGeometryCommands(geometry.outline, 24),
     ...(definition?.solid3d ? [] : [
@@ -349,6 +398,12 @@ export function connectionPointsForBox(shape: {
     ]),
   ] : [];
   const points = paths.flat();
+  const localBounds = points.length ? {
+    minX: Math.min(...points.map(point => point[0])), maxX: Math.max(...points.map(point => point[0])),
+    minY: Math.min(...points.map(point => point[1])), maxY: Math.max(...points.map(point => point[1])),
+  } : { minX: 0, maxX: shape.w, minY: 0, maxY: shape.h };
+  const localCenterX = solidOrigin ? (localBounds.minX + localBounds.maxX) / 2 : shape.w / 2;
+  const localCenterY = solidOrigin ? (localBounds.minY + localBounds.maxY) / 2 : shape.h / 2;
   const rayIntersection = (axis: 'x' | 'y', coordinate: number, direction: 'min' | 'max'): [number, number] | null => {
     const candidates: [number, number][] = [];
     for (const path of paths) {
@@ -370,8 +425,8 @@ export function connectionPointsForBox(shape: {
       }
     }
     const outward = candidates.filter(([x, y]) => axis === 'x'
-      ? (direction === 'min' ? y <= shape.h / 2 + 1e-7 : y >= shape.h / 2 - 1e-7)
-      : (direction === 'min' ? x <= shape.w / 2 + 1e-7 : x >= shape.w / 2 - 1e-7));
+      ? (direction === 'min' ? y <= localCenterY + 1e-7 : y >= localCenterY - 1e-7)
+      : (direction === 'min' ? x <= localCenterX + 1e-7 : x >= localCenterX - 1e-7));
     if (!outward.length) return null;
     const compareIndex = axis === 'x' ? 1 : 0;
     return outward.reduce((best, point) => direction === 'min'
@@ -380,24 +435,26 @@ export function connectionPointsForBox(shape: {
   };
   const fallbackExtreme = (axis: 'x' | 'y', direction: 'min' | 'max'): [number, number] => {
     if (!points.length) return axis === 'x'
-      ? [direction === 'min' ? 0 : shape.w, shape.h / 2]
-      : [shape.w / 2, direction === 'min' ? 0 : shape.h];
+      ? [direction === 'min' ? localBounds.minX : localBounds.maxX, localCenterY]
+      : [localCenterX, direction === 'min' ? localBounds.minY : localBounds.maxY];
     const primary = (point: [number, number]) => point[axis === 'x' ? 0 : 1];
     const lateral = (point: [number, number]) => point[axis === 'x' ? 1 : 0];
-    const center = axis === 'x' ? shape.w / 2 : shape.h / 2;
+    const center = axis === 'x' ? localCenterY : localCenterX;
     const extreme = points.reduce((value, point) => direction === 'min' ? Math.min(value, primary(point)) : Math.max(value, primary(point)), direction === 'min' ? Infinity : -Infinity);
     return points.filter(point => Math.abs(primary(point) - extreme) < 1e-6)
       .reduce((best, point) => Math.abs(lateral(point) - center) < Math.abs(lateral(best) - center) ? point : best);
   };
   const local = [
-    { id: 'top', point: rayIntersection('x', shape.w / 2, 'min') ?? fallbackExtreme('y', 'min') },
-    { id: 'right', point: rayIntersection('y', shape.h / 2, 'max') ?? fallbackExtreme('x', 'max') },
-    { id: 'bottom', point: rayIntersection('x', shape.w / 2, 'max') ?? fallbackExtreme('y', 'max') },
-    { id: 'left', point: rayIntersection('y', shape.h / 2, 'min') ?? fallbackExtreme('x', 'min') },
-    { id: 'center', point: [shape.w / 2, shape.h / 2] as [number, number] },
+    { id: 'top', point: rayIntersection('x', localCenterX, 'min') ?? fallbackExtreme('y', 'min') },
+    { id: 'right', point: rayIntersection('y', localCenterY, 'max') ?? fallbackExtreme('x', 'max') },
+    { id: 'bottom', point: rayIntersection('x', localCenterX, 'max') ?? fallbackExtreme('y', 'max') },
+    { id: 'left', point: rayIntersection('y', localCenterY, 'min') ?? fallbackExtreme('x', 'min') },
+    { id: 'center', point: (solidOrigin ? [0, 0] : [shape.w / 2, shape.h / 2]) as [number, number] },
   ];
   return local.map(({ id, point: [x, y] }) => {
-    const world = objectPointToWorld(shape, { x, y });
+    const world = solidOrigin
+      ? (() => { const [wx, wy] = rotatePoint(shape.x + x, shape.y + y, shape.x, shape.y, shape.rotation ?? 0); return { x: wx, y: wy }; })()
+      : objectPointToWorld(shape, { x, y });
     return { id, x: world.x, y: world.y };
   });
 }

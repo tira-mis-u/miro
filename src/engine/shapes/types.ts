@@ -1,7 +1,6 @@
 export const SHAPE_CATEGORIES = [
   'Basic',
   '3D Shapes',
-  'Flowchart',
   'ERD / Database',
   'Use Case Diagram',
   'Class Diagram',
@@ -10,7 +9,8 @@ export const SHAPE_CATEGORIES = [
   'State Diagram',
 ] as const;
 
-export type ShapeCategory = typeof SHAPE_CATEGORIES[number];
+/** Hidden taxonomy retained only so legacy Flowchart definitions remain renderable on old boards. */
+export type ShapeCategory = typeof SHAPE_CATEGORIES[number] | 'Flowchart';
 export type ShapeKind = 'shape' | 'connector';
 
 /** Shared native path primitives used by semantic definitions across all libraries. */
@@ -31,7 +31,8 @@ export type GeometryKind =
   | 'cube3d' | 'cuboid3d' | 'cylinder3d' | 'cone3d' | 'sphere3d' | 'pyramid3d' | 'quadrilateralPyramid3d'
   | 'tetrahedron3d' | 'rightTetrahedron3d' | 'octahedron3d' | 'triangularPrism3d' | 'quadrilateralPrism3d'
   | 'pentagonalPrism3d' | 'hexagonalPrism3d' | 'squarePrism3d' | 'pentagonalPyramid3d'
-  | 'hexagonalPyramid3d' | 'pyramidFrustum3d' | 'coneFrustum3d';
+  | 'hexagonalPyramid3d' | 'pyramidFrustum3d' | 'coneFrustum3d'
+  | 'rightQuadrilateralPyramid3d' | 'rightTrapezoidPyramid3d' | 'rightTrapezoidPerpendicularPyramid3d';
 
 export type StrokeStyle = 'solid' | 'dashed' | 'dotted';
 export type ConnectorRouteKind = 'straight' | 'curved' | 'orthogonal' | 'elbow';
@@ -123,6 +124,8 @@ export interface ShapeDefinition {
   /** Initial text attached to semantic relationships such as UML include/extend/use. */
   readonly defaultLabel?: string;
   readonly defaultParams?: Readonly<Record<string, number | string | boolean>>;
+  /** Canonical local XYZ dimensions for 3D solids; projected canvas bounds are always derived. */
+  readonly defaultScale3d?: Readonly<{ x: number; y: number; z: number }>;
   /** Metadata is derived once from defaults and shared by the generic property editor and audits. */
   readonly parameterMetadata?: readonly ShapeParameterMetadata[];
   /** Structured editor capabilities (classifier/table/column) derived from semantic default data. */
@@ -184,6 +187,8 @@ export interface DiagramShapeObject {
   params: Record<string, unknown>;
   /** Independent local X/Y/Z dimension factors applied to 3D vertices before XYZ rotation; omitted on legacy records. */
   scale3d?: { x: number; y: number; z: number };
+  /** Versioned 3D local-pose migration marker; omitted by legacy records. */
+  solid3dPoseVersion?: number;
   data?: DiagramData;
   /** Stable semantic ownership edge for nested UML/BPMN containers. */
   containerId?: string;

@@ -35,7 +35,7 @@ export function getCanvasShortcutAction(
 
   const toolByKey: Record<string, ToolType | 'img'> = {
     v: 'select', p: 'pen', e: 'eraser', s: 'sticky',
-    t: 'text', r: 'rect', o: 'ellipse', a: 'arrow', i: 'img',
+    t: 'text', r: 'rect', o: 'ellipse', a: 'block-arrow', i: 'img',
   };
   const action = toolByKey[event.key.toLowerCase()];
   if (action === 'img') return { type: 'open-image' };

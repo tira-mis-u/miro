@@ -3,7 +3,8 @@ import type { PathCommand } from './types';
 export type Solid3DGeometry = 'cube3d' | 'cuboid3d' | 'cylinder3d' | 'cone3d' | 'sphere3d' | 'pyramid3d'
   | 'tetrahedron3d' | 'rightTetrahedron3d' | 'octahedron3d' | 'triangularPrism3d' | 'quadrilateralPrism3d'
   | 'pentagonalPrism3d' | 'hexagonalPrism3d' | 'squarePrism3d' | 'pentagonalPyramid3d' | 'hexagonalPyramid3d'
-  | 'quadrilateralPyramid3d' | 'pyramidFrustum3d' | 'coneFrustum3d';
+  | 'quadrilateralPyramid3d' | 'pyramidFrustum3d' | 'coneFrustum3d'
+  | 'rightQuadrilateralPyramid3d' | 'rightTrapezoidPyramid3d' | 'rightTrapezoidPerpendicularPyramid3d';
 export type Solid3DRotationAxis = 'rotationX' | 'rotationY' | 'rotationZ';
 export interface Solid3DScale { x: number; y: number; z: number; }
 export interface Solid3DProjectionOptions {
@@ -26,48 +27,79 @@ export interface Solid3DModelFace { key: string; vertices: number[]; normal: Vec
 export interface Solid3DModelEdge { key: string; a: number; b: number; faces: number[]; depth: number; visibility: 'visible' | 'hidden' | 'silhouette'; semantic: boolean; }
 export interface Solid3DModel { vertices: Solid3DModelVertex[]; faces: Solid3DModelFace[]; edges: Solid3DModelEdge[]; }
 
-// One shared cabinet-style oblique projection keeps the schoolbook box axes exact: local +X is
-// screen-horizontal, local +Y is screen-vertical, and local +Z recedes diagonally left/down. This
-// is one affine 3D view transform (with a consistent null-ray for visibility), not a 2D path
-// rotation or per-solid correction. Its +Z camera-depth is 0.875, preserving a legible corner reveal.
-const OBLIQUE_X_PER_Z = -0.478;
-const OBLIQUE_SCREEN_Y_PER_Z = 0.279;
-const CAMERA: Vec3 = (() => {
-  const length = Math.hypot(-OBLIQUE_X_PER_Z, OBLIQUE_SCREEN_Y_PER_Z, 1);
-  return [-OBLIQUE_X_PER_Z / length, OBLIQUE_SCREEN_Y_PER_Z / length, 1 / length];
-})();
-// Covariance of the shared projection for a unit sphere. This yields its continuous elliptical
-// silhouette under the same 3D view transform used by polyhedra and revolved surfaces.
-const PROJECTION_XX = 1 + OBLIQUE_X_PER_Z ** 2;
-const PROJECTION_YY = 1 + OBLIQUE_SCREEN_Y_PER_Z ** 2;
-const PROJECTION_XY = OBLIQUE_X_PER_Z * OBLIQUE_SCREEN_Y_PER_Z;
-const PROJECTION_MAX_STRETCH = Math.sqrt(0.5 * (PROJECTION_XX + PROJECTION_YY
-  + Math.hypot(PROJECTION_XX - PROJECTION_YY, 2 * PROJECTION_XY)));
+// One coherent orthographic axonometric camera. The model is Z-up: its view direction has a
+// 45° azimuth in the horizontal XY plane and a 30° elevation. Screen-right and screen-up are
+// derived from +Z so the camera has no roll, +Z projects vertically, and X/Y remain oblique.
+export const SOLID3D_CAMERA_AZIMUTH_DEGREES = 45;
+export const SOLID3D_CAMERA_ELEVATION_DEGREES = 30;
+const CAMERA_AZIMUTH = SOLID3D_CAMERA_AZIMUTH_DEGREES * Math.PI / 180;
+const CAMERA_ELEVATION = SOLID3D_CAMERA_ELEVATION_DEGREES * Math.PI / 180;
+const CAMERA_RIGHT: Vec3 = [Math.cos(CAMERA_AZIMUTH), Math.sin(CAMERA_AZIMUTH), 0];
+const CAMERA_FORWARD: Vec3 = [Math.cos(CAMERA_ELEVATION) * Math.sin(CAMERA_AZIMUTH),
+  -Math.cos(CAMERA_ELEVATION) * Math.cos(CAMERA_AZIMUTH), Math.sin(CAMERA_ELEVATION)];
+const CAMERA_UP: Vec3 = [-Math.sin(CAMERA_ELEVATION) * Math.sin(CAMERA_AZIMUTH),
+  Math.sin(CAMERA_ELEVATION) * Math.cos(CAMERA_AZIMUTH), Math.cos(CAMERA_ELEVATION)];
+// The two orthographic screen basis rows are orthonormal, so their maximum singular value is 1.
+const PROJECTION_MAX_STRETCH = 1;
 export const SOLID3D_CANONICAL_CUBOID_ROLL_DEGREES = 0;
 export const SOLID3D_CANONICAL_CUBE_ROTATION_X_DEGREES = 0;
-// The front face is XY, so no local yaw is needed: X stays exactly horizontal and Y exactly vertical.
+// Shape Picker definition parameters remain neutral; CanvasEngine applies this explicit initial
+// local yaw to newly-created board objects so the main canvas shows three actual model faces.
+export const SOLID3D_CANVAS_INITIAL_YAW_DEGREES = 0;
+export const SOLID3D_POSE_VERSION = 2;
 export const SOLID3D_CANONICAL_CUBE_ROTATION_Y_DEGREES = 0;
 export const SOLID3D_CANONICAL_CUBE_ROTATION_Z_DEGREES = 0;
 const canonicalPolygonPhase = (sides: number) => Math.PI / 2 - Math.PI / Math.max(3, sides);
 
 /**
  * Canonical local 3D convention for model geometry, controls and persisted params:
- * +X points screen-right, +Y points screen-up, and +Z points toward/out of the screen. One fixed
- * cabinet-style oblique parallel view maps +X exactly horizontal, +Y exactly vertical, and +Z
- * diagonally left/down. Its depth ray is the null direction of the affine projection, so face
- * visibility and projected geometry share the same 3D view. Angles are degrees; scale precedes the
- * intrinsic Euler transform M = Rx * Ry * Rz, then view depth/occlusion and projection. `rotationZ`
- * turns about the current local depth axis. The board's 2D `rotation` remains an independent outer transform.
+ * +X is width, +Y is depth, and +Z is height/world-up. Every mesh is authored about its
+ * documented, stable local origin; its model vertices, renderer paths, hit geometry and gizmo
+ * pivot all use that same origin. Screen coordinates are dot(P,cameraRight) and -dot(P,cameraUp);
+ * depth and face visibility use the same forward vector. The orthographic basis is derived from
+ * world-up +Z, a 45° azimuth in XY and 30° elevation, so +Z remains screen-vertical without camera
+ * roll. Angles are degrees; scale precedes the intrinsic Euler transform M = Rx * Ry * Rz. The
+ * board's 2D `rotation` remains an independent outer transform about the model origin.
  */
+export const SOLID3D_LOCAL_ORIGIN_DESCRIPTIONS: Readonly<Record<Solid3DGeometry, string>> = Object.freeze({
+  cube3d: 'geometric center of the equal-edge cube',
+  cuboid3d: 'geometric center of the rectangular prism',
+  cylinder3d: 'midpoint between the two XY base centers on the local Z axis',
+  cone3d: 'midpoint between the XY base center and the local-Z apex',
+  coneFrustum3d: 'midpoint between the two XY base centers on the local Z axis',
+  sphere3d: 'geometric center of the sphere',
+  pyramid3d: 'mid-height point above the XY base centroid; apex offsets do not move the origin',
+  tetrahedron3d: 'volume centroid of the regular tetrahedron',
+  rightTetrahedron3d: 'volume centroid of the trirectangular tetrahedron',
+  octahedron3d: 'geometric center of the octahedron',
+  triangularPrism3d: 'midpoint between the two XY triangular-base centroids',
+  quadrilateralPrism3d: 'midpoint between the two XY irregular-quadrilateral base centroids',
+  pentagonalPrism3d: 'midpoint between the two XY pentagonal-base centroids',
+  hexagonalPrism3d: 'midpoint between the two XY hexagonal-base centroids',
+  squarePrism3d: 'midpoint between the two XY square-base centroids',
+  pentagonalPyramid3d: 'mid-height point above the XY base centroid; apex offsets do not move the origin',
+  hexagonalPyramid3d: 'mid-height point above the XY base centroid; apex offsets do not move the origin',
+  quadrilateralPyramid3d: 'mid-height point above the irregular XY base area centroid; apex offsets do not move the origin',
+  rightQuadrilateralPyramid3d: 'mid-height point above the rectangular XY base centroid',
+  rightTrapezoidPyramid3d: 'mid-height point above the right-trapezoid XY base area centroid',
+  rightTrapezoidPerpendicularPyramid3d: 'mid-height point above the right-trapezoid XY base area centroid; one lateral edge is the local-Z perpendicular from base vertex A',
+  pyramidFrustum3d: 'midpoint between the two XY polygon-base centroids on the local Z axis',
+});
+
 export const SOLID3D_COORDINATE_CONVENTION = Object.freeze({
-  axes: Object.freeze({ x: 'right', y: 'up', z: 'toward-camera' }),
-  camera: 'fixed cabinet-style oblique parallel view; +Z depth ray has +X and +Y components',
-  projection: 'affine cabinet projection; +X exactly right, +Y exactly up, +Z diagonally left/down',
-  viewDirection: Object.freeze([...CAMERA]),
+  axes: Object.freeze({ x: 'local width axis', y: 'local depth axis', z: 'local height/world-up axis' }),
+  worldUp: Object.freeze([0, 0, 1]),
+  cameraRight: Object.freeze([...CAMERA_RIGHT]),
+  cameraUp: Object.freeze([...CAMERA_UP]),
+  camera: 'orthographic; worldUp=+Z; azimuth=45 degrees in XY; elevation=30 degrees; no camera roll; projected world Z remains vertical',
+  projection: 'dot(P,cameraRight), -dot(P,cameraUp) with an orthonormal screen basis derived from world-up +Z',
+  viewDirection: Object.freeze([...CAMERA_FORWARD]),
   rotationOrder: 'scale, then local Euler X/Y/Z; point matrix Rx * Ry * Rz (apply local Z, then Y, then X); translate in board space after projection',
   angleUnit: 'degrees',
   depth: 'normalized local axial/extrusion extent; independent of canvas width and height',
-  planarRotation: 'independent DiagramShapeObject.rotation',
+  localOrigin: 'the origin is [0,0,0] in every authored mesh; the per-solid anchor is documented by SOLID3D_LOCAL_ORIGIN_DESCRIPTIONS and is never inferred from projected or axis-aligned bounds',
+  planarRotation: 'independent DiagramShapeObject.rotation about the model origin',
+  defaultCanvasPose: 'neutral local Euler pose; +X width, +Y depth, +Z height/world-up; the no-roll orthographic camera projects X/Y obliquely and Z vertically; board-plane rotation remains independent',
   orientationScale: 'fixed by the unrotated model radius and fixed projection; no per-orientation re-fit',
 });
 
@@ -132,35 +164,34 @@ const normalize3 = (point: Vec3): Vec3 => {
   return [point[0] / length, point[1] / length, point[2] / length];
 };
 
-/** Apply the shared fixed screen projection to a vector in already-rotated model coordinates. */
+/** Orthographic projection of an already rotated model-space vector, in screen-right/down axes. */
 export function projectSolid3DVector(point: readonly [number, number, number]): [number, number] {
-  // Screen coordinates are right/down; local X and Y therefore project exactly horizontal/vertical.
-  return [point[0] + OBLIQUE_X_PER_Z * point[2], -point[1] + OBLIQUE_SCREEN_Y_PER_Z * point[2]];
+  return [dot(point as Vec3, CAMERA_RIGHT), -dot(point as Vec3, CAMERA_UP)];
 }
 
-/** Signed oblique-view depth: positive values face the camera; negative values recede behind it. */
+/** Signed depth along the camera's coherent forward axis; positive means toward the viewer. */
 export function solid3DCameraDepth(point: readonly [number, number, number]): number {
-  return point[0] * CAMERA[0] + point[1] * CAMERA[1] + point[2] * CAMERA[2];
+  return dot(point as Vec3, CAMERA_FORWARD);
 }
 
-function boxMesh(depth: number, baseRatio = 1): Mesh {
-  const halfX = Math.max(0.25, Math.min(2.5, baseRatio)) / 2;
+/** A unit box mesh; semantic dimensions are supplied by the pre-rotation local scale. */
+function boxMesh(): Mesh {
   return { vertices: [
-    [-halfX, -0.5, -depth / 2], [halfX, -0.5, -depth / 2], [halfX, 0.5, -depth / 2], [-halfX, 0.5, -depth / 2],
-    [-halfX, -0.5, depth / 2], [halfX, -0.5, depth / 2], [halfX, 0.5, depth / 2], [-halfX, 0.5, depth / 2],
+    [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5],
+    [-0.5, -0.5, 0.5], [0.5, -0.5, 0.5], [0.5, 0.5, 0.5], [-0.5, 0.5, 0.5],
   ], faces: [[0, 3, 2, 1], [4, 5, 6, 7], [0, 1, 5, 4], [3, 7, 6, 2], [0, 4, 7, 3], [1, 2, 6, 5]] };
 }
 
 function regularPrismMesh(sides: number, depth: number, phase = canonicalPolygonPhase(sides), radius = 0.5): Mesh {
   const safeSides = Math.round(Math.max(3, Math.min(32, sides)));
-  // Put both congruent polygon bases on horizontal XZ planes. The extrusion/height runs along
-  // model +Y so triangular, pentagonal and hexagonal prism bases read as textbook top/bottom faces.
+  // Bases lie in local XY and the extrusion runs along local Z. The negated section Y keeps the
+  // canonical polygon phase consistent with the former right-handed Y-up mesh after coordinate migration.
   const section: Vec2[] = Array.from({ length: safeSides }, (_, index) => {
     const angle = phase + index * Math.PI * 2 / safeSides;
-    return [Math.cos(angle) * radius, Math.sin(angle) * radius];
+    return [Math.cos(angle) * radius, -Math.sin(angle) * radius];
   });
-  const top: Vec3[] = section.map(([x, z]) => [x, depth / 2, z]);
-  const bottom: Vec3[] = section.map(([x, z]) => [x, -depth / 2, z]);
+  const top: Vec3[] = section.map(([x, y]) => [x, y, depth / 2]);
+  const bottom: Vec3[] = section.map(([x, y]) => [x, y, -depth / 2]);
   const faces: number[][] = [Array.from({ length: safeSides }, (_, index) => index),
     Array.from({ length: safeSides }, (_, index) => safeSides + (safeSides - 1 - index))];
   for (let index = 0; index < safeSides; index++) {
@@ -170,21 +201,20 @@ function regularPrismMesh(sides: number, depth: number, phase = canonicalPolygon
   return { vertices: [...top, ...bottom], faces };
 }
 
-const QUADRILATERAL_BASE_HALF_DEPTH = 0.8;
+/** A fixed, genuinely irregular convex quadrilateral, centered at its area centroid. */
+const IRREGULAR_QUADRILATERAL_BASE: readonly Vec2[] = Object.freeze([
+  [-0.526110007, -0.394284480], [0.301987325, -0.387993574],
+  [0.367275621, 0.283740747], [0.012144288, 0.621399376],
+]);
 
-function convexQuadrilateralSection(insetRatio: number): Vec2[] {
-  const inset = numberParam({ insetRatio }, 'insetRatio', 0.68, 0.25, 0.95);
-  // A symmetric trapezoid lies in the true horizontal XZ plane. Its front and back edges are
-  // local-X edges, so the shared cabinet projection renders both exactly level without rotating
-  // or regularizing the requested base geometry.
-  const halfDepth = QUADRILATERAL_BASE_HALF_DEPTH;
-  return [[-0.5, halfDepth], [0.5, halfDepth], [inset / 2, -halfDepth], [-inset / 2, -halfDepth]];
+function convexQuadrilateralSection(): Vec2[] {
+  return IRREGULAR_QUADRILATERAL_BASE.map(([x, y]) => [x, y]);
 }
 
-function convexQuadrilateralPrismMesh(depth: number, insetRatio: number): Mesh {
-  const section = convexQuadrilateralSection(insetRatio);
-  const top = section.map(([x, z]): Vec3 => [x, depth / 2, z]);
-  const bottom = section.map(([x, z]): Vec3 => [x, -depth / 2, z]);
+function convexQuadrilateralPrismMesh(depth: number): Mesh {
+  const section = convexQuadrilateralSection();
+  const top = section.map(([x, y]): Vec3 => [x, y, depth / 2]);
+  const bottom = section.map(([x, y]): Vec3 => [x, y, -depth / 2]);
   const faces: number[][] = [[0, 1, 2, 3], [7, 6, 5, 4]];
   for (let index = 0; index < 4; index++) {
     const next = (index + 1) % 4;
@@ -193,37 +223,80 @@ function convexQuadrilateralPrismMesh(depth: number, insetRatio: number): Mesh {
   return { vertices: [...top, ...bottom], faces };
 }
 
-function convexQuadrilateralPyramidMesh(
-  depth: number, insetRatio: number, apexOffsetX: number, apexOffsetZ: number,
-): Mesh {
-  const inset = numberParam({ insetRatio }, 'insetRatio', 0.68, 0.25, 0.95);
+function convexQuadrilateralPyramidMesh(depth: number, apexOffsetX: number, apexOffsetY: number): Mesh {
   const halfHeight = Math.max(0.15, Math.min(2.5, depth)) / 2;
-  const section = convexQuadrilateralSection(inset);
-  const base: Vec3[] = section.map(([x, z]) => [x, -halfHeight, z]);
-  // Place an unshifted apex over the polygon's area centroid; explicit offsets then move only
-  // the true apex in X/Z, without modifying/regularizing the base.
-  const centroidZ = QUADRILATERAL_BASE_HALF_DEPTH
-    - QUADRILATERAL_BASE_HALF_DEPTH * (1 + 2 * inset) / (3 * (1 + inset));
-  const baseCenterX = 0;
-  const baseCenterZ = centroidZ;
-  const apex: Vec3 = [baseCenterX + numberParam({ apexOffsetX }, 'apexOffsetX', 0, -1, 1) * 0.5,
-    halfHeight, baseCenterZ + numberParam({ apexOffsetZ }, 'apexOffsetZ', 0, -1, 1) * 0.5];
+  const section = convexQuadrilateralSection();
+  const base: Vec3[] = section.map(([x, y]) => [x, y, -halfHeight]);
+  // The local XY base is fixed and remains centered at its true area centroid. The apex offset
+  // changes only the apex; the stable origin stays halfway up from the base centroid.
+  const apex: Vec3 = [numberParam({ apexOffsetX }, 'apexOffsetX', 0, -1, 1) * 0.5,
+    numberParam({ apexOffsetY }, 'apexOffsetY', 0, -1, 1) * 0.5, halfHeight];
   return { vertices: [...base, apex], faces: [[3, 2, 1, 0], [0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]] };
 }
 
+
+/** A fixed right trapezoid: AB ∥ CD and AD ⟂ AB/CD; its area centroid is recentered at XY origin. */
+const RIGHT_TRAPEZOID_BASE_RAW: readonly Vec2[] = Object.freeze([
+  [-0.6, -0.4], [0.6, -0.4], [0.2, 0.4], [-0.6, 0.4],
+]);
+
+function recenterPolygonAtAreaCentroid(section: readonly Vec2[]): Vec2[] {
+  let twiceArea = 0, centroidX6Area = 0, centroidY6Area = 0;
+  for (let index = 0; index < section.length; index++) {
+    const [x0, y0] = section[index], [x1, y1] = section[(index + 1) % section.length];
+    const cross = x0 * y1 - x1 * y0;
+    twiceArea += cross;
+    centroidX6Area += (x0 + x1) * cross;
+    centroidY6Area += (y0 + y1) * cross;
+  }
+  if (Math.abs(twiceArea) < 1e-10) throw new Error('Pyramid base must have non-zero area');
+  const centroid: Vec2 = [centroidX6Area / (3 * twiceArea), centroidY6Area / (3 * twiceArea)];
+  return section.map(([x, y]) => [x - centroid[0], y - centroid[1]]);
+}
+
+function rightTrapezoidSection(): Vec2[] {
+  return recenterPolygonAtAreaCentroid(RIGHT_TRAPEZOID_BASE_RAW);
+}
+
+function quadrilateralPyramidMesh(depth: number, section: readonly Vec2[], apexProjection: Vec2): Mesh {
+  const halfHeight = Math.max(0.15, Math.min(2.5, depth)) / 2;
+  const base: Vec3[] = section.map(([x, y]) => [x, y, -halfHeight]);
+  const apex: Vec3 = [apexProjection[0], apexProjection[1], halfHeight];
+  return { vertices: [...base, apex], faces: [[3, 2, 1, 0], [0, 1, 4], [1, 2, 4], [2, 3, 4], [3, 0, 4]] };
+}
+
+/** Rectangular-base right pyramid: the local-Z altitude is perpendicular to the rectangle. */
+function rightQuadrilateralPyramidMesh(depth: number): Mesh {
+  const rectangularBase: readonly Vec2[] = [
+    [-0.5, -0.4], [0.5, -0.4], [0.5, 0.4], [-0.5, 0.4],
+  ];
+  return quadrilateralPyramidMesh(depth, rectangularBase, [0, 0]);
+}
+
+/** The apex projection is above the right-trapezoid area centroid; no lateral edge is vertical. */
+function rightTrapezoidPyramidMesh(depth: number): Mesh {
+  return quadrilateralPyramidMesh(depth, rightTrapezoidSection(), [0, 0]);
+}
+
+/** Apex is above base vertex A, making exactly lateral edge A→apex perpendicular to the XY base. */
+function rightTrapezoidPerpendicularPyramidMesh(depth: number): Mesh {
+  const section = rightTrapezoidSection();
+  return quadrilateralPyramidMesh(depth, section, section[0]);
+}
+
 function regularPyramidMesh(
-  sides: number, depth: number, radius = 0.5, phase = canonicalPolygonPhase(sides), apexOffsetX = 0, apexOffsetZ = 0,
+  sides: number, depth: number, radius = 0.5, phase = canonicalPolygonPhase(sides), apexOffsetX = 0, apexOffsetY = 0,
 ): Mesh {
   const safeSides = Math.round(Math.max(3, Math.min(32, sides)));
-  // `depth` is the apex-to-base height, not a scale applied to one horizontal base axis.
-  // The default is centered, but explicit X/Z offsets preserve useful oblique/non-right pyramids.
+  // `depth` is the apex-to-base height along local Z. The base is in XY and offsets move only
+  // the apex within that base plane; neither parameter changes the declared mid-height origin.
   const halfHeight = Math.max(0.15, Math.min(2.5, depth)) / 2;
   const vertices: Vec3[] = Array.from({ length: safeSides }, (_, index) => {
     const angle = phase + index * Math.PI * 2 / safeSides;
-    return [Math.cos(angle) * radius, -halfHeight, Math.sin(angle) * radius];
+    return [Math.cos(angle) * radius, -Math.sin(angle) * radius, -halfHeight];
   });
   const apex = vertices.length;
-  vertices.push([apexOffsetX, halfHeight, apexOffsetZ]);
+  vertices.push([apexOffsetX, apexOffsetY, halfHeight]);
   const faces: number[][] = [Array.from({ length: safeSides }, (_, index) => safeSides - 1 - index)];
   for (let index = 0; index < safeSides; index++) faces.push([index, (index + 1) % safeSides, apex]);
   return { vertices, faces };
@@ -234,11 +307,11 @@ function pyramidFrustumMesh(sides: number, depth: number, topRatio: number, radi
   const halfHeight = Math.max(0.15, Math.min(2.5, depth)) / 2;
   const base: Vec3[] = Array.from({ length: safeSides }, (_, index) => {
     const angle = phase + index * Math.PI * 2 / safeSides;
-    return [Math.cos(angle) * radius, -halfHeight, Math.sin(angle) * radius];
+    return [Math.cos(angle) * radius, -Math.sin(angle) * radius, -halfHeight];
   });
   const top: Vec3[] = Array.from({ length: safeSides }, (_, index) => {
     const angle = phase + index * Math.PI * 2 / safeSides;
-    return [Math.cos(angle) * radius * topRatio, halfHeight, Math.sin(angle) * radius * topRatio];
+    return [Math.cos(angle) * radius * topRatio, -Math.sin(angle) * radius * topRatio, halfHeight];
   });
   const faces: number[][] = [Array.from({ length: safeSides }, (_, index) => safeSides - 1 - index),
     Array.from({ length: safeSides }, (_, index) => safeSides + index)];
@@ -249,31 +322,30 @@ function pyramidFrustumMesh(sides: number, depth: number, topRatio: number, radi
   return { vertices: [...base, ...top], faces };
 }
 
-/** Regular tetrahedron with a horizontal equilateral XZ base and one horizontal front edge. */
+/** Regular tetrahedron with a horizontal equilateral XY base and local +Z apex. */
 function tetrahedronMesh(heightRatio: number): Mesh {
   const radius = 1 / Math.sqrt(3), height = Math.sqrt(2 / 3) * Math.max(0.15, Math.min(2.5, heightRatio));
-  const baseY = -height / 4, apexY = 3 * height / 4, phase = canonicalPolygonPhase(3);
+  const baseZ = -height / 4, apexZ = 3 * height / 4, phase = canonicalPolygonPhase(3);
   const vertices: Vec3[] = Array.from({ length: 3 }, (_, index) => {
     const angle = phase + index * Math.PI * 2 / 3;
-    return [Math.cos(angle) * radius, baseY, Math.sin(angle) * radius];
+    return [Math.cos(angle) * radius, -Math.sin(angle) * radius, baseZ];
   });
-  vertices.push([0, apexY, 0]);
+  vertices.push([0, 0, apexZ]);
   return { vertices, faces: [[0, 2, 1], [0, 1, 3], [1, 2, 3], [2, 0, 3]] };
 }
 
 /**
  * Trirectangular tetrahedron: three pairwise-perpendicular legs meet at one lower base vertex.
- * The two horizontal legs form a right-triangular XZ base; the editable heightRatio is the
- * perpendicular +Y leg length relative to either unit base leg. Centering by the solid centroid
- * keeps the object's 3D pivot stable without moving the mathematically right-angle vertex.
+ * Two legs lie in the XY base; the editable heightRatio is the perpendicular +Z altitude
+ * relative to either unit base leg. The mesh is translated so its volume centroid is the origin.
  */
 function rightTetrahedronMesh(heightRatio: number): Mesh {
-  const legX = 1, legZ = 1, legY = Math.max(0.2, Math.min(2, heightRatio));
+  const legX = 1, legY = 1, legZ = Math.max(0.2, Math.min(2, heightRatio));
   const uncentered: Vec3[] = [
-    [legX / 2, 0, legZ / 2],                 // right-angle vertex A
-    [-legX / 2, 0, legZ / 2],                // A→B: -X
-    [legX / 2, 0, -legZ / 2],                // A→C: -Z
-    [legX / 2, legY, legZ / 2],              // A→D: +Y, perpendicular altitude
+    [legX / 2, -legY / 2, 0],               // right-angle vertex A
+    [-legX / 2, -legY / 2, 0],              // A→B: -X
+    [legX / 2, legY / 2, 0],                // A→C: +Y
+    [legX / 2, -legY / 2, legZ],            // A→D: +Z, perpendicular altitude
   ];
   const centroid = uncentered.reduce<Vec3>((sum, vertex) => [
     sum[0] + vertex[0] / uncentered.length,
@@ -286,39 +358,109 @@ function rightTetrahedronMesh(heightRatio: number): Mesh {
 
 function octahedronMesh(depth: number): Mesh {
   const radius = 0.5;
-  return { vertices: [[radius, 0, 0], [-radius, 0, 0], [0, radius, 0], [0, -radius, 0], [0, 0, radius * depth], [0, 0, -radius * depth]],
+  // The legacy fixed `depth` parameter now scales local Y after the Y-up→Z-up basis conversion.
+  return { vertices: [[radius, 0, 0], [-radius, 0, 0], [0, 0, radius], [0, 0, -radius],
+      [0, -radius * depth, 0], [0, radius * depth, 0]],
     faces: [[2, 0, 4], [2, 4, 1], [2, 1, 5], [2, 5, 0], [3, 4, 0], [3, 1, 4], [3, 5, 1], [3, 0, 5]] };
 }
 
-export function solid3DScaleFromBounds(width: number, height: number, referenceWidth: number, referenceHeight: number, _geometry?: Solid3DGeometry): Solid3DScale {
+export function solid3DScaleFromBounds(width: number, height: number, referenceWidth: number, referenceHeight: number, geometry?: Solid3DGeometry): Solid3DScale {
   const sx = Math.max(0.01, Math.min(64, (Number.isFinite(width) ? width : referenceWidth) / Math.max(1, referenceWidth)));
-  const sy = Math.max(0.01, Math.min(64, (Number.isFinite(height) ? height : referenceHeight) / Math.max(1, referenceHeight)));
-  // Old records without a local scale still preserve independent canvas width and height. Their
-  // unspecified receding axis uses the narrower ratio as a conservative depth fallback; new
-  // objects persist all three independent local factors explicitly.
-  return { x: sx, y: sy, z: Math.min(sx, sy) };
+  const sz = Math.max(0.01, Math.min(64, (Number.isFinite(height) ? height : referenceHeight) / Math.max(1, referenceHeight)));
+  // Legacy 2D frames are only a migration hint: width maps to X, projected height to Z, and
+  // the otherwise-unknown local depth Y receives the smaller scale. New creation never uses this.
+  const candidate = { x: sx, y: Math.min(sx, sz), z: sz };
+  return geometry ? normalizeSolid3DScale(geometry, candidate) : candidate;
 }
 
-function normalizeScale(scale?: Solid3DScale, _geometry?: Solid3DGeometry): Solid3DScale {
+/** Shape-family dimension invariants enforced at every create/edit/deserialize boundary. */
+export type Solid3DSizeSemantics = 'independent' | 'isotropic' | 'radial-xy' | 'regular-base-xy';
+export type Solid3DSizeAxis = 'x' | 'y' | 'z';
+
+export function solid3DSizeSemantics(geometry: Solid3DGeometry): Solid3DSizeSemantics {
+  if (geometry === 'cube3d' || geometry === 'sphere3d' || geometry === 'tetrahedron3d' || geometry === 'octahedron3d')
+    return 'isotropic';
+  if (geometry === 'cylinder3d' || geometry === 'cone3d' || geometry === 'coneFrustum3d') return 'radial-xy';
+  if (geometry === 'pyramid3d' || geometry === 'pentagonalPyramid3d' || geometry === 'hexagonalPyramid3d'
+      || geometry === 'pyramidFrustum3d' || geometry === 'squarePrism3d'
+      || geometry === 'pentagonalPrism3d' || geometry === 'hexagonalPrism3d') return 'regular-base-xy';
+  // Cuboid, convex quadrilateral-base solids, triangular-prism base width/height, and a
+  // trirectangular tetrahedron support independent orthogonal dimensions without changing topology.
+  return 'independent';
+}
+
+/** The active local-axis handle's semantic dimensions, shared by the gizmo and property panel. */
+export function solid3DSizeGroup(geometry: Solid3DGeometry, axis: Solid3DSizeAxis): Solid3DSizeAxis[] {
+  const semantics = solid3DSizeSemantics(geometry);
+  if (semantics === 'isotropic') return ['x', 'y', 'z'];
+  if ((semantics === 'radial-xy' || semantics === 'regular-base-xy') && axis !== 'z') return ['x', 'y'];
+  return [axis];
+}
+
+export function normalizeSolid3DScale(geometry: Solid3DGeometry, scale?: Solid3DScale): Solid3DScale {
   const safe = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? Math.max(0.01, Math.min(64, value)) : 1;
-  // These are true pre-rotation local-axis scale factors, not a screen-space fit hint. Never
-  // collapse them to a uniform value: X, Y and Z dimensions remain independently editable.
-  return { x: safe(scale?.x), y: safe(scale?.y), z: safe(scale?.z) };
+  const x = safe(scale?.x), y = safe(scale?.y), z = safe(scale?.z);
+  const semantics = solid3DSizeSemantics(geometry);
+  if (semantics === 'isotropic') {
+    const equalEdge = Math.max(0.01, Math.min(64, Math.cbrt(x * y * z)));
+    return { x: equalEdge, y: equalEdge, z: equalEdge };
+  }
+  if (semantics === 'radial-xy' || semantics === 'regular-base-xy') {
+    const baseDimension = Math.max(0.01, Math.min(64, Math.sqrt(x * y)));
+    return { x: baseDimension, y: baseDimension, z };
+  }
+  return { x, y, z };
+}
+
+const localSpanCache = new Map<string, [number, number, number]>();
+const LOCAL_MESH_PARAMETER_KEYS = ['depth', 'sides', 'heightRatio', 'topRadiusRatio', 'apexOffsetX', 'apexOffsetY'] as const;
+
+/** Model-space dimension spans before scale/rotation, used by properties and axis-size response. */
+export function solid3DLocalAxisSpans(
+  geometry: Solid3DGeometry, params: Readonly<Record<string, unknown>> = {},
+): [number, number, number] {
+  const meshParams = Object.fromEntries(LOCAL_MESH_PARAMETER_KEYS.flatMap(key => key in params ? [[key, params[key]]] : []));
+  const key = `${geometry}|${JSON.stringify(meshParams)}`;
+  const cached = localSpanCache.get(key);
+  if (cached) return [...cached];
+  const projection = buildSolid3DProjection(geometry, 1, 1, meshParams, {
+    scale: { x: 1, y: 1, z: 1 }, referenceWidth: 1, referenceHeight: 1,
+  });
+  const spans = [0, 1, 2].map(axis => {
+    const values = projection.model.vertices.map(vertex => vertex.local[axis]);
+    return Math.max(1e-6, Math.max(...values) - Math.min(...values));
+  }) as [number, number, number];
+  if (localSpanCache.size > 256) localSpanCache.delete(localSpanCache.keys().next().value!);
+  localSpanCache.set(key, spans);
+  return [...spans];
+}
+
+export function solid3DLocalDimensions(
+  geometry: Solid3DGeometry, params: Readonly<Record<string, unknown>> = {}, scale?: Solid3DScale,
+): Solid3DScale {
+  const spans = solid3DLocalAxisSpans(geometry, params), normalized = normalizeSolid3DScale(geometry, scale);
+  return { x: spans[0] * normalized.x, y: spans[1] * normalized.y, z: spans[2] * normalized.z };
+}
+
+function normalizeScale(scale?: Solid3DScale, geometry?: Solid3DGeometry): Solid3DScale {
+  const safe = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? Math.max(0.01, Math.min(64, value)) : 1;
+  const normalized = { x: safe(scale?.x), y: safe(scale?.y), z: safe(scale?.z) };
+  return geometry ? normalizeSolid3DScale(geometry, normalized) : normalized;
 }
 
 function sphereSurfaceMesh(longitudes = 32, latitudes = 16): Mesh {
-  const radius = 0.5, vertices: Vec3[] = [[0, -radius, 0]], rings: number[][] = [];
+  const radius = 0.5, vertices: Vec3[] = [[0, 0, -radius]], rings: number[][] = [];
   for (let latitude = 1; latitude < latitudes; latitude++) {
     const phi = -Math.PI / 2 + latitude * Math.PI / latitudes;
     const ring: number[] = [];
     for (let longitude = 0; longitude < longitudes; longitude++) {
       const theta = longitude * Math.PI * 2 / longitudes;
       ring.push(vertices.length);
-      vertices.push([radius * Math.cos(phi) * Math.cos(theta), radius * Math.sin(phi), radius * Math.cos(phi) * Math.sin(theta)]);
+      vertices.push([radius * Math.cos(phi) * Math.cos(theta), -radius * Math.cos(phi) * Math.sin(theta), radius * Math.sin(phi)]);
     }
     rings.push(ring);
   }
-  const top = vertices.length; vertices.push([0, radius, 0]);
+  const top = vertices.length; vertices.push([0, 0, radius]);
   const faces: number[][] = [];
   const first = rings[0], last = rings.at(-1)!;
   for (let longitude = 0; longitude < longitudes; longitude++) {
@@ -337,17 +479,17 @@ function sphereSurfaceMesh(longitudes = 32, latitudes = 16): Mesh {
 }
 
 function revolvedSurfaceMesh(geometry: 'cylinder3d' | 'cone3d' | 'coneFrustum3d', depth: number, params: Readonly<Record<string, unknown>>, segments = 64): Mesh {
-  const radius = 0.5, topY = depth / 2, bottomY = -depth / 2;
+  const radius = 0.5, topZ = depth / 2, bottomZ = -depth / 2;
   const topRadius = geometry === 'coneFrustum3d' ? radius * numberParam(params, 'topRadiusRatio', 0.38, 0.05, 0.95) : radius;
   const bottomRadius = radius;
   const vertices: Vec3[] = [];
-  const ring = (y: number, r: number) => Array.from({ length: segments }, (_, index) => {
+  const ring = (z: number, r: number) => Array.from({ length: segments }, (_, index) => {
     const angle = index * Math.PI * 2 / segments;
-    const id = vertices.length; vertices.push([Math.cos(angle) * r, y, Math.sin(angle) * r]); return id;
+    const id = vertices.length; vertices.push([Math.cos(angle) * r, -Math.sin(angle) * r, z]); return id;
   });
-  const bottom = ring(bottomY, bottomRadius);
-  const top = geometry === 'cone3d' ? [] : ring(topY, topRadius);
-  const apex = geometry === 'cone3d' ? vertices.push([0, topY, 0]) - 1 : -1;
+  const bottom = ring(bottomZ, bottomRadius);
+  const top = geometry === 'cone3d' ? [] : ring(topZ, topRadius);
+  const apex = geometry === 'cone3d' ? vertices.push([0, 0, topZ]) - 1 : -1;
   const faces: number[][] = [];
   if (geometry === 'cone3d') {
     for (let index = 0; index < segments; index++) faces.push([bottom[index], bottom[(index + 1) % segments], apex]);
@@ -388,23 +530,24 @@ function projectMesh(mesh: Mesh, transform: (point: Vec3) => Vec3, project: (poi
 
 function createPolyhedronMesh(geometry: Solid3DGeometry, depth: number, params: Readonly<Record<string, unknown>>): Mesh {
   // Cube is always an equal-edge 3D model. Its local depth is not an editable cuboid parameter.
-  if (geometry === 'cube3d') return boxMesh(1, 1);
-  if (geometry === 'cuboid3d') return boxMesh(depth, numberParam(params, 'baseRatio', 1.28, 0.5, 2.5));
+  if (geometry === 'cube3d' || geometry === 'cuboid3d') return boxMesh();
   if (geometry === 'tetrahedron3d') return tetrahedronMesh(depth);
   if (geometry === 'rightTetrahedron3d') return rightTetrahedronMesh(numberParam(params, 'heightRatio', 0.6, 0.2, 2));
   if (geometry === 'octahedron3d') return octahedronMesh(depth);
-  if (geometry === 'quadrilateralPrism3d')
-    return convexQuadrilateralPrismMesh(depth, numberParam(params, 'baseInsetRatio', 0.68, 0.25, 0.95));
+  if (geometry === 'quadrilateralPrism3d') return convexQuadrilateralPrismMesh(depth);
   if (geometry === 'quadrilateralPyramid3d')
-    return convexQuadrilateralPyramidMesh(depth, numberParam(params, 'baseInsetRatio', 0.68, 0.25, 0.95),
-      numberParam(params, 'apexOffsetX', 0, -1, 1), numberParam(params, 'apexOffsetZ', 0, -1, 1));
+    return convexQuadrilateralPyramidMesh(depth, numberParam(params, 'apexOffsetX', 0, -1, 1),
+      numberParam(params, 'apexOffsetY', 0, -1, 1));
+  if (geometry === 'rightQuadrilateralPyramid3d') return rightQuadrilateralPyramidMesh(depth);
+  if (geometry === 'rightTrapezoidPyramid3d') return rightTrapezoidPyramidMesh(depth);
+  if (geometry === 'rightTrapezoidPerpendicularPyramid3d') return rightTrapezoidPerpendicularPyramidMesh(depth);
   if (geometry === 'pyramid3d' || geometry === 'pentagonalPyramid3d' || geometry === 'hexagonalPyramid3d') {
     const defaultSides = geometry === 'pentagonalPyramid3d' ? 5 : geometry === 'hexagonalPyramid3d' ? 6 : 4;
     const sides = Math.round(numberParam(params, 'sides', defaultSides, 3, 32));
     const squareBase = sides === 4, baseRadius = squareBase ? Math.SQRT1_2 : 0.5;
     const apexOffsetX = numberParam(params, 'apexOffsetX', 0, -1, 1) * baseRadius;
-    const apexOffsetZ = numberParam(params, 'apexOffsetZ', 0, -1, 1) * baseRadius;
-    return regularPyramidMesh(sides, depth, baseRadius, canonicalPolygonPhase(sides), apexOffsetX, apexOffsetZ);
+    const apexOffsetY = numberParam(params, 'apexOffsetY', 0, -1, 1) * baseRadius;
+    return regularPyramidMesh(sides, depth, baseRadius, canonicalPolygonPhase(sides), apexOffsetX, apexOffsetY);
   }
   if (geometry === 'pyramidFrustum3d') {
     const sides = Math.round(numberParam(params, 'sides', 4, 3, 32));
@@ -422,13 +565,49 @@ function createPolyhedronMesh(geometry: Solid3DGeometry, depth: number, params: 
 /** Shared intrinsic local Euler transform for projected meshes and the local-axis basis helpers. */
 export function rotateSolid3DVector(point: Vec3, rotationX: number, rotationY: number, rotationZ: number): Vec3 {
   const [x, y, z] = point;
-  // M = Rx * Ry * Rz: apply a depth-axis roll in model coordinates, then local Y, then local X.
+  // M = Rx * Ry * Rz: apply local Z, then local Y, then local X in the right-handed Z-up basis.
   const cosZ = Math.cos(radians(rotationZ)), sinZ = Math.sin(radians(rotationZ));
   const x1 = x * cosZ - y * sinZ, y1 = x * sinZ + y * cosZ, z1 = z;
   const cosY = Math.cos(radians(rotationY)), sinY = Math.sin(radians(rotationY));
   const x2 = x1 * cosY + z1 * sinY, z2 = -x1 * sinY + z1 * cosY;
   const cosX = Math.cos(radians(rotationX)), sinX = Math.sin(radians(rotationX));
   return [x2, y1 * cosX - z2 * sinX, y1 * sinX + z2 * cosX];
+}
+
+/** Convert a persisted local scale from the former X-width/Y-up/Z-depth basis to Z-up. */
+export function migrateSolid3DScaleFromYUp(scale: Solid3DScale): Solid3DScale {
+  return { x: scale.x, y: scale.z, z: scale.y };
+}
+
+/**
+ * Preserve an existing object's orientation when its local basis changes from Y-up to Z-up.
+ * C maps old vectors (x,y,z) to (x,-z,y), so the migrated rotation matrix is C R C⁻¹;
+ * the result is decomposed back into the repository's Rx * Ry * Rz Euler storage order.
+ */
+export function migrateSolid3DRotationFromYUp(params: Readonly<Record<string, unknown>> = {}) {
+  const rotationX = numberParam(params, 'rotationX', 0, -360, 360);
+  const rotationY = numberParam(params, 'rotationY', 0, -360, 360);
+  const rotationZ = numberParam(params, 'rotationZ', 0, -360, 360);
+  const toOld: (point: Vec3) => Vec3 = ([x, y, z]) => [x, z, -y];
+  const toNew: (point: Vec3) => Vec3 = ([x, y, z]) => [x, -z, y];
+  const migratedColumns: Vec3[] = ([ [1, 0, 0], [0, 1, 0], [0, 0, 1] ] as Vec3[]).map(axis =>
+    toNew(rotateSolid3DVector(toOld(axis), rotationX, rotationY, rotationZ)));
+  const [columnX, columnY, columnZ] = migratedColumns;
+  const principalY = Math.asin(Math.max(-1, Math.min(1, columnZ[0])));
+  const cosineY = Math.cos(principalY);
+  let principalX: number, principalZ: number;
+  if (Math.abs(cosineY) > 1e-8) {
+    principalX = Math.atan2(-columnZ[1], columnZ[2]);
+    principalZ = Math.atan2(-columnY[0], columnX[0]);
+  } else {
+    principalX = 0;
+    principalZ = Math.atan2(columnX[1], columnY[1]);
+  }
+  const toDegrees = (angle: number) => {
+    const degrees = angle * 180 / Math.PI;
+    return Math.abs(degrees) < 1e-12 ? 0 : degrees;
+  };
+  return { rotationX: toDegrees(principalX), rotationY: toDegrees(principalY), rotationZ: toDegrees(principalZ) };
 }
 
 export function solid3DRotationParams(params: Readonly<Record<string, unknown>> = {}) {
@@ -493,22 +672,33 @@ export function rotateSolid3DOrientationAboutLocalAxis(
     xAxis.map((value, index) => value * cosine + yAxis[index] * sine) as Vec3,
     xAxis.map((value, index) => -value * sine + yAxis[index] * cosine) as Vec3, zAxis];
   const [nextX, nextY, nextZ] = nextColumns;
-  const rotationY = Math.asin(Math.max(-1, Math.min(1, nextZ[0])));
-  const cosineY = Math.cos(rotationY);
-  let rotationX: number, rotationZ: number;
+  const principalY = Math.asin(Math.max(-1, Math.min(1, nextZ[0])));
+  const cosineY = Math.cos(principalY);
+  let principalX: number, principalZ: number;
   if (Math.abs(cosineY) > 1e-8) {
-    rotationX = Math.atan2(-nextZ[1], nextZ[2]);
-    rotationZ = Math.atan2(-nextY[0], nextX[0]);
+    principalX = Math.atan2(-nextZ[1], nextZ[2]);
+    principalZ = Math.atan2(-nextY[0], nextX[0]);
   } else {
-    rotationX = 0;
-    rotationZ = Math.atan2(nextX[1], nextY[1]);
+    principalX = 0;
+    principalZ = Math.atan2(nextX[1], nextY[1]);
   }
   const nearestDegrees = (angle: number, reference: number) => {
     const degrees = angle * 180 / Math.PI;
     return Math.max(-360, Math.min(360, degrees + 360 * Math.round((reference - degrees) / 360)));
   };
-  return { rotationX: nearestDegrees(rotationX, start.rotationX), rotationY: nearestDegrees(rotationY, start.rotationY),
-    rotationZ: nearestDegrees(rotationZ, start.rotationZ) };
+  const candidates: Array<[number, number, number]> = [[principalX, principalY, principalZ]];
+  if (Math.abs(cosineY) > 1e-8) {
+    // XYZ Euler decomposition has two equivalent branches. Always choose the branch closest to
+    // the current field values; otherwise crossing ±90° spuriously jumps X and Z by 180° even
+    // though the drag is a smooth rotation about one actual local axis.
+    candidates.push([principalX + Math.PI, Math.PI - principalY, principalZ + Math.PI]);
+  }
+  const closest = candidates.map(([x, y, z]) => ({ rotationX: nearestDegrees(x, start.rotationX),
+    rotationY: nearestDegrees(y, start.rotationY), rotationZ: nearestDegrees(z, start.rotationZ) }))
+    .sort((left, right) => Math.abs(left.rotationX - start.rotationX) + Math.abs(left.rotationY - start.rotationY)
+      + Math.abs(left.rotationZ - start.rotationZ) - Math.abs(right.rotationX - start.rotationX)
+      - Math.abs(right.rotationY - start.rotationY) - Math.abs(right.rotationZ - start.rotationZ))[0];
+  return closest;
 }
 
 function convexHull(points: Vec2[]): Vec2[] {
@@ -630,14 +820,17 @@ function appendLinePath(target: PathCommand[], from: Vec2, to: Vec2) {
   target.push(command('moveTo', ...from), command('lineTo', ...to));
 }
 
-// Canonical poses are geometry-aligned: model X/Y remain screen-horizontal/vertical and +Z
-// supplies the coherent receding depth. Family-specific base/apex axes live in the mesh itself.
+// Neutral mesh coordinates remain the semantic local X/Y/Z axes. New canvas objects use the same
+// neutral mathematical orientation as their registered definition; the orthographic camera and
+// true hidden-edge classification expose the geometry without baking in a compensating yaw.
 const DEFAULTS: Record<Solid3DGeometry, [number, number, number, number]> = {
   cube3d: [SOLID3D_CANONICAL_CUBE_ROTATION_X_DEGREES, SOLID3D_CANONICAL_CUBE_ROTATION_Y_DEGREES,
     SOLID3D_CANONICAL_CUBE_ROTATION_Z_DEGREES, 1],
   cuboid3d: [0, 0, SOLID3D_CANONICAL_CUBOID_ROLL_DEGREES, 0.72],
   cylinder3d: [0, 0, 0, 0.78], cone3d: [0, 0, 0, 0.78], coneFrustum3d: [0, 0, 0, 0.78], sphere3d: [0, 0, 0, 1],
   pyramid3d: [0, 0, 0, 1], quadrilateralPyramid3d: [0, 0, 0, 1],
+  rightQuadrilateralPyramid3d: [0, 0, 0, 1], rightTrapezoidPyramid3d: [0, 0, 0, 1],
+  rightTrapezoidPerpendicularPyramid3d: [0, 0, 0, 1],
   pentagonalPyramid3d: [0, 0, 0, 1], hexagonalPyramid3d: [0, 0, 0, 1],
   pyramidFrustum3d: [0, 0, 0, 1], tetrahedron3d: [0, 0, 0, 1], rightTetrahedron3d: [0, 0, 0, 0.6],
   octahedron3d: [0, 0, 0, 1], triangularPrism3d: [0, 0, 0, 0.82], quadrilateralPrism3d: [0, 0, 0, 0.8],
@@ -690,11 +883,11 @@ export function buildSolid3DProjection(
       const [screenX, screenY] = projectSolid3DVector(point);
       return [center[0] + screenX * projectedScale, center[1] + screenY * projectedScale];
     };
-    // One local XZ great circle: its projection is governed solely by the persisted XYZ pose.
-    const localEquatorPoint = (angle: number): Vec3 => [Math.cos(angle) * radius, 0, Math.sin(angle) * radius];
+    // One local XY great circle perpendicular to world-up Z; its projection follows the persisted pose.
+    const localEquatorPoint = (angle: number): Vec3 => [Math.cos(angle) * radius, -Math.sin(angle) * radius, 0];
     const pointAt = (angle: number) => transform(localEquatorPoint(angle));
     const normalAt = (angle: number) => transformNormal(localEquatorPoint(angle).map(value => value / radius) as Vec3);
-    addCurve(splitParametricCurve('sphere:equator', pointAt, angle => dot(normalAt(angle), CAMERA), project, CURVE_SAMPLES));
+    addCurve(splitParametricCurve('sphere:equator', pointAt, angle => dot(normalAt(angle), CAMERA_FORWARD), project, CURVE_SAMPLES));
     mesh = sphereSurfaceMesh();
     const renderedMesh = projectMesh(mesh, transform, project, false);
     // A locally scaled/rotated sphere is a true ellipsoid, whose exact orthographic silhouette is
@@ -727,26 +920,27 @@ export function buildSolid3DProjection(
 
   if (geometry === 'cylinder3d' || geometry === 'cone3d' || geometry === 'coneFrustum3d') {
     const heightModel = depth, radius = 0.5;
-    const ringPoint = (y: number, ringRadius: number, angle: number): Vec3 => [Math.cos(angle) * ringRadius, y, Math.sin(angle) * ringRadius];
-    const ringSamples = (y: number, ringRadius: number): Vec3[] => Array.from({ length: CURVE_SAMPLES }, (_, index) => ringPoint(y, ringRadius, index * Math.PI * 2 / CURVE_SAMPLES));
-    const topNormal: Vec3 = [0, 1, 0], bottomNormal: Vec3 = [0, -1, 0];
+    const ringPoint = (z: number, ringRadius: number, angle: number): Vec3 =>
+      [Math.cos(angle) * ringRadius, -Math.sin(angle) * ringRadius, z];
+    const ringSamples = (z: number, ringRadius: number): Vec3[] =>
+      Array.from({ length: CURVE_SAMPLES }, (_, index) => ringPoint(z, ringRadius, index * Math.PI * 2 / CURVE_SAMPLES));
+    const topNormal: Vec3 = [0, 0, 1], bottomNormal: Vec3 = [0, 0, -1];
     let silhouetteSamples: Vec3[] = [];
     let sideNormalAt: (angle: number) => Vec3;
-    let topY = heightModel / 2, bottomY = -heightModel / 2, topRadius = radius, bottomRadius = radius;
+    const topZ = heightModel / 2, bottomZ = -heightModel / 2;
+    let topRadius = radius, bottomRadius = radius;
 
     if (geometry === 'cylinder3d') {
-      topY = heightModel / 2; bottomY = -heightModel / 2;
-      silhouetteSamples = [...ringSamples(topY, radius), ...ringSamples(bottomY, radius)];
-      sideNormalAt = angle => [Math.cos(angle), 0, Math.sin(angle)];
+      silhouetteSamples = [...ringSamples(topZ, radius), ...ringSamples(bottomZ, radius)];
+      sideNormalAt = angle => [Math.cos(angle), -Math.sin(angle), 0];
     } else if (geometry === 'cone3d') {
-      topY = heightModel / 2; bottomY = -heightModel / 2;
-      silhouetteSamples = [...ringSamples(bottomY, radius), [0, topY, 0]];
-      sideNormalAt = angle => normalize3([heightModel * Math.cos(angle), radius, heightModel * Math.sin(angle)]);
+      silhouetteSamples = [...ringSamples(bottomZ, radius), [0, 0, topZ]];
+      sideNormalAt = angle => normalize3([heightModel * Math.cos(angle), -heightModel * Math.sin(angle), radius]);
     } else {
       const ratio = numberParam(params, 'topRadiusRatio', 0.38, 0.05, 0.95);
       topRadius = radius * ratio; bottomRadius = radius;
-      silhouetteSamples = [...ringSamples(topY, topRadius), ...ringSamples(bottomY, bottomRadius)];
-      sideNormalAt = angle => normalize3([heightModel * Math.cos(angle), bottomRadius - topRadius, heightModel * Math.sin(angle)]);
+      silhouetteSamples = [...ringSamples(topZ, topRadius), ...ringSamples(bottomZ, bottomRadius)];
+      sideNormalAt = angle => normalize3([heightModel * Math.cos(angle), -heightModel * Math.sin(angle), bottomRadius - topRadius]);
     }
     modelSamples = silhouetteSamples;
     const rotatedSamples = modelSamples.map(transform);
@@ -758,23 +952,23 @@ export function buildSolid3DProjection(
     };
     const visibleMargin = (angle: number, cap: Vec3) => Math.max(normalDepth(sideNormalAt(angle)), normalDepth(cap));
     if (geometry === 'cylinder3d') {
-      addCurve(splitParametricCurve('cylinder:top-rim', angle => transform(ringPoint(topY, radius, angle)), angle => visibleMargin(angle, topNormal), project, CURVE_SAMPLES));
-      addCurve(splitParametricCurve('cylinder:bottom-rim', angle => transform(ringPoint(bottomY, radius, angle)), angle => visibleMargin(angle, bottomNormal), project, CURVE_SAMPLES));
+      addCurve(splitParametricCurve('cylinder:top-rim', angle => transform(ringPoint(topZ, radius, angle)), angle => visibleMargin(angle, topNormal), project, CURVE_SAMPLES));
+      addCurve(splitParametricCurve('cylinder:bottom-rim', angle => transform(ringPoint(bottomZ, radius, angle)), angle => visibleMargin(angle, bottomNormal), project, CURVE_SAMPLES));
     } else if (geometry === 'cone3d') {
-      addCurve(splitParametricCurve('cone:base-rim', angle => transform(ringPoint(bottomY, radius, angle)), angle => visibleMargin(angle, bottomNormal), project, CURVE_SAMPLES));
+      addCurve(splitParametricCurve('cone:base-rim', angle => transform(ringPoint(bottomZ, radius, angle)), angle => visibleMargin(angle, bottomNormal), project, CURVE_SAMPLES));
     } else {
-      addCurve(splitParametricCurve('cone-frustum:top-rim', angle => transform(ringPoint(topY, topRadius, angle)), angle => visibleMargin(angle, topNormal), project, CURVE_SAMPLES));
-      addCurve(splitParametricCurve('cone-frustum:bottom-rim', angle => transform(ringPoint(bottomY, bottomRadius, angle)), angle => visibleMargin(angle, bottomNormal), project, CURVE_SAMPLES));
+      addCurve(splitParametricCurve('cone-frustum:top-rim', angle => transform(ringPoint(topZ, topRadius, angle)), angle => visibleMargin(angle, topNormal), project, CURVE_SAMPLES));
+      addCurve(splitParametricCurve('cone-frustum:bottom-rim', angle => transform(ringPoint(bottomZ, bottomRadius, angle)), angle => visibleMargin(angle, bottomNormal), project, CURVE_SAMPLES));
     }
     const cameraX = normalDepth([1, 0, 0]), cameraY = normalDepth([0, 1, 0]), cameraZ = normalDepth([0, 0, 1]);
     const sideA = geometry === 'cylinder3d' ? cameraX : heightModel * cameraX;
-    const sideB = geometry === 'cylinder3d' ? cameraZ : heightModel * cameraZ;
+    const sideB = geometry === 'cylinder3d' ? -cameraY : -heightModel * cameraY;
     const sideC = geometry === 'cylinder3d' ? 0
-      : (geometry === 'cone3d' ? radius : bottomRadius - topRadius) * cameraY;
+      : (geometry === 'cone3d' ? radius : bottomRadius - topRadius) * cameraZ;
     const tangentAngles = sinusoidRoots(sideA, sideB, sideC);
     tangentAngles.forEach((angle, index) => {
-      const a = geometry === 'cone3d' ? [0, topY, 0] as Vec3 : ringPoint(topY, topRadius, angle);
-      const b = ringPoint(bottomY, bottomRadius, angle);
+      const a = geometry === 'cone3d' ? [0, 0, topZ] as Vec3 : ringPoint(topZ, topRadius, angle);
+      const b = ringPoint(bottomZ, bottomRadius, angle);
       appendLinePath(visibleEdges, project(transform(a)), project(transform(b)));
       visibleEdgeKeys.push(`${geometry}:silhouette-generator:${index}`);
     });
@@ -786,7 +980,7 @@ export function buildSolid3DProjection(
     const outlinePoints = rotatedSamples.map(project), hull = convexHull(outlinePoints);
     const outline = polylineCommands(hull, true);
     const projectedBounds = { minX: Math.min(...hull.map(point => point[0])), minY: Math.min(...hull.map(point => point[1])),
-      maxX: Math.max(...hull.map(point => point[0])), maxY: Math.max(...hull.map(point => point[1])) };
+      maxX: Math.max(...hull.map(point => point[0])), maxY: Math.max(...hull.map(point => point[1]) ) };
     return { outline, visibleEdges, hiddenEdges, visibleFaces: renderedMesh.visibleFaces, model: renderedMesh.model,
       metadata: { geometry, rotationX, rotationY, rotationZ, depth, visibleFaceCount,
         visibleEdgeCount: visibleEdgeKeys.length, hiddenEdgeCount: hiddenEdgeKeys.length, projectedScale,
@@ -822,5 +1016,6 @@ export function isSolid3DGeometry(value: string): value is Solid3DGeometry {
   return ['cube3d', 'cuboid3d', 'cylinder3d', 'cone3d', 'coneFrustum3d', 'sphere3d', 'pyramid3d',
     'quadrilateralPyramid3d', 'pyramidFrustum3d', 'pentagonalPyramid3d', 'hexagonalPyramid3d',
     'tetrahedron3d', 'rightTetrahedron3d', 'octahedron3d', 'triangularPrism3d', 'quadrilateralPrism3d',
-    'squarePrism3d', 'pentagonalPrism3d', 'hexagonalPrism3d'].includes(value);
+    'squarePrism3d', 'pentagonalPrism3d', 'hexagonalPrism3d', 'rightQuadrilateralPyramid3d',
+    'rightTrapezoidPyramid3d', 'rightTrapezoidPerpendicularPyramid3d'].includes(value);
 }

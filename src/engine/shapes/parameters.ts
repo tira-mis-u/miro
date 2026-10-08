@@ -29,15 +29,14 @@ export const SHAPE_PARAMETER_SCHEMA: Readonly<Record<string, ParameterSchema>> =
   topRatio: { label: 'Top width ratio', description: 'Top width as a fraction of the base width.', control: range(0.18, 1, 0.01, undefined, 2), previewImpact: 'geometry' },
   tailPosition: { label: 'Tail position', description: 'Horizontal position of the callout pointer along the body.', control: range(0.1, 0.8, 0.01, undefined, 2), previewImpact: 'geometry' },
   sides: { label: 'Sides', description: 'Number of sides in the regular polygon or prism/pyramid base.', control: range(3, 32, 1, undefined, 0), previewImpact: 'geometry' },
-  baseInsetRatio: { label: 'Quadrilateral base inset', description: 'Rear parallel edge width relative to the front edge in the convex trapezoid base.', control: range(0.25, 0.95, 0.01, undefined, 2), previewImpact: 'geometry' },
-  heightRatio: { label: 'Height ratio', description: 'Length of the +Y perpendicular leg relative to either unit horizontal leg; all three legs meet pairwise at a right-angle vertex.', control: range(0.2, 2, 0.01, undefined, 2), previewImpact: 'geometry' },
+  heightRatio: { label: 'Height ratio', description: 'Length of the +Z perpendicular leg relative to either unit XY base leg; all three legs meet pairwise at a right-angle vertex.', control: range(0.2, 2, 0.01, undefined, 2), previewImpact: 'geometry' },
   points: { label: 'Star points', description: 'Number of outer points in the star.', control: range(3, 24, 1, undefined, 0), previewImpact: 'geometry' },
   innerRatio: { label: 'Inner radius', description: 'Inner-to-outer radius ratio for the star.', control: range(0.12, 0.88, 0.01, undefined, 2), previewImpact: 'geometry' },
   armRatio: { label: 'Arm width', description: 'Relative width of the cross arms.', control: range(0.16, 0.72, 0.01, undefined, 2), previewImpact: 'geometry' },
   shaftRatio: { label: 'Shaft height', description: 'Relative height of a block-arrow shaft.', control: range(0.16, 0.72, 0.01, undefined, 2), previewImpact: 'geometry' },
-  depth: { label: 'Depth', description: 'Normalized local solid thickness or axial/extrusion extent; independent of canvas width and height.', control: range(0.15, 2.5, 0.01, undefined, 2), previewImpact: 'geometry' },
+  depth: { label: 'Height / extrusion · Z', description: 'Normalized local-Z height, axial height, or prism/frustum extrusion extent; independent of canvas width and height.', control: range(0.15, 2.5, 0.01, undefined, 2), previewImpact: 'geometry' },
   apexOffsetX: { label: 'Apex offset X', description: 'Horizontal displacement of a pyramid apex from the base center, as a fraction of the base radius.', control: range(-1, 1, 0.01, undefined, 2), previewImpact: 'geometry' },
-  apexOffsetZ: { label: 'Apex offset Z', description: 'Depth displacement of a pyramid apex from the base center, as a fraction of the base radius.', control: range(-1, 1, 0.01, undefined, 2), previewImpact: 'geometry' },
+  apexOffsetY: { label: 'Apex offset Y', description: 'In-plane Y displacement of a pyramid apex from the XY base centroid, as a fraction of the base radius.', control: range(-1, 1, 0.01, undefined, 2), previewImpact: 'geometry' },
   rotationX: { label: 'X rotation', description: '3D orientation about model-space X; independent from planar object rotation.', control: range(-360, 360, 0.001, '°', 3), previewImpact: 'geometry' },
   rotationY: { label: 'Y rotation', description: '3D orientation about model-space Y; independent from planar object rotation.', control: range(-360, 360, 0.001, '°', 3), previewImpact: 'geometry' },
   rotationZ: { label: 'Z rotation', description: '3D orientation about model-space Z; independent from planar object rotation.', control: range(-360, 360, 0.001, '°', 3), previewImpact: 'geometry' },
@@ -79,20 +78,24 @@ const DERIVED_PARAMETER_DESCRIPTIONS: Readonly<Record<string, string>> = Object.
 const humanize = (key: string) => key.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/^./, character => character.toUpperCase());
 
 export function buildShapeParameterMetadata(
-  definition: Pick<ShapeDefinition, 'defaultParams'>,
+  definition: Pick<ShapeDefinition, 'defaultParams'> & Partial<Pick<ShapeDefinition, 'id' | 'geometry'>>,
 ): readonly ShapeParameterMetadata[] {
   return Object.entries(definition.defaultParams ?? {}).map(([key, defaultValue]) => {
     const schema = SHAPE_PARAMETER_SCHEMA[key];
     const legacyDescription = LEGACY_SHAPE_PARAMETER_METADATA[key];
     const derivedDescription = DERIVED_PARAMETER_DESCRIPTIONS[key];
+    const identityLocked = key === 'depth' && (definition.geometry === 'tetrahedron3d' || definition.geometry === 'octahedron3d');
     const status: ShapeParameterMetadata['status'] = derivedDescription ? 'derived'
       : legacyDescription ? 'legacy'
-        : schema?.control ? 'user-editable' : 'internal';
+        : identityLocked ? 'internal'
+          : schema?.control ? 'user-editable' : 'internal';
     return Object.freeze({
       key,
       label: schema?.label ?? humanize(key),
       status,
-      description: derivedDescription ?? legacyDescription ?? schema?.description ?? 'Internal implementation parameter; not user-editable.',
+      description: derivedDescription ?? legacyDescription ?? (identityLocked
+        ? 'Fixed at its mathematical regular-solid default so the shape remains a true tetrahedron/octahedron.'
+        : schema?.description) ?? 'Internal implementation parameter; not user-editable.',
       defaultValue,
       ...(status === 'user-editable' && schema?.control ? { control: schema.control } : {}),
       previewImpact: schema?.previewImpact ?? 'none',
