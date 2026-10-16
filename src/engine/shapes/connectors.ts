@@ -375,11 +375,15 @@ function cardinalityPaths(cardinality: string | undefined, point: [number, numbe
   const ux = dx / length, uy = dy / length;
   const at = (distance: number): [number, number] => [point[0] - ux * distance, point[1] - uy * distance];
   const hasMany = cardinality === 'many' || cardinality === 'one-or-many' || cardinality === 'zero-or-many';
-  const hasOne = cardinality === 'one' || cardinality === 'one-or-many';
   const hasZero = cardinality === 'zero-or-one' || cardinality === 'zero-or-many';
   const paths: ConnectorPreviewPath[] = [];
   if (hasMany) paths.push(...markerPath('crowFoot', point, neighbor, size * 0.9));
-  if (hasOne) paths.push(...markerPath('bar', at(cardinality === 'one-or-many' ? size * 0.7 : 0), neighbor, size * 0.72));
+  if (cardinality === 'one') {
+    paths.push(...markerPath('bar', point, neighbor, size * 0.72));
+    paths.push(...markerPath('bar', at(size * 0.45), neighbor, size * 0.72));
+  } else if (cardinality === 'one-or-many') {
+    paths.push(...markerPath('bar', at(size * 0.7), neighbor, size * 0.72));
+  }
   if (hasZero) {
     const center = at(cardinality === 'zero-or-one' ? size * 0.45 : size * 0.85);
     paths.push({ commands: [command('moveTo', center[0] + size * 0.22, center[1]), command('ellipse', center[0], center[1], size * 0.22, size * 0.22, 0, 0, Math.PI * 2, 0), command('closePath')], fill: 'surface' });
@@ -393,14 +397,21 @@ export function buildConnectorPreviewGeometry(definition: ShapeDefinition, width
   const margin = Math.min(4, Math.max(2, Math.min(width, height) * 0.12));
   const start: [number, number] = [margin, height * 0.76];
   const end: [number, number] = [width - margin, height * 0.24];
+  const connector = definition.connector;
+  if (connector?.erdParticipation === 'total') {
+    const dx = end[0] - start[0], dy = end[1] - start[1], length = Math.max(1e-6, Math.hypot(dx, dy));
+    const nx = -dy / length * 1.75, ny = dx / length * 1.75;
+    const path1 = pathFromPoints([[start[0] + nx, start[1] + ny], [end[0] + nx, end[1] + ny]]);
+    const path2 = pathFromPoints([[start[0] - nx, start[1] - ny], [end[0] - nx, end[1] - ny]]);
+    return { width, height, route: [...path1, ...path2], markers: [], lineStyle: connector?.lineStyle ?? 'solid' };
+  }
   const route = buildConnectorRoute({ routeKind: definition.routeKind, x1: start[0], y1: start[1], x2: end[0], y2: end[1], waypoints: [] });
   const routePath = pathFromPoints(route);
   const startNeighbor = route[1] ?? end, endNeighbor = route[route.length - 2] ?? start;
   const size = Math.max(2.2, Math.min(width, height) * 0.19);
-  const connector = definition.connector;
   const markers = [
-    ...markerPath(connector?.startMarker ?? 'none', start, startNeighbor, size),
-    ...markerPath(connector?.endMarker ?? 'none', end, endNeighbor, size),
+    ...(connector?.sourceCardinality ? [] : markerPath(connector?.startMarker ?? 'none', start, startNeighbor, size)),
+    ...(connector?.targetCardinality ? [] : markerPath(connector?.endMarker ?? 'none', end, endNeighbor, size)),
     ...cardinalityPaths(connector?.sourceCardinality, start, startNeighbor, size),
     ...cardinalityPaths(connector?.targetCardinality, end, endNeighbor, size),
   ];

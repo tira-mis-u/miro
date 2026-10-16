@@ -584,6 +584,9 @@ export function deserializeBoardShape(mapKey: string, raw: unknown): Record<stri
       ...(stateTransition ? { stateTransition } : {}),
       ...(activityFlow ? { activityFlow } : {}),
       ...(usecaseExtend ? { usecaseExtend } : {}),
+      ...(raw.erdParticipation === 'total' || raw.erdParticipation === 'partial'
+        ? { erdParticipation: raw.erdParticipation }
+        : definition.connector?.erdParticipation ? { erdParticipation: definition.connector.erdParticipation } : {}),
       ...connectorBounds({ shapeId: definition.id, x1: raw.x1, y1: raw.y1, x2: raw.x2, y2: raw.y2, waypoints, startMarker, endMarker,
         sourceCardinality: isCardinality(raw.sourceCardinality) ? raw.sourceCardinality : definition.connector?.sourceCardinality,
         targetCardinality: isCardinality(raw.targetCardinality) ? raw.targetCardinality : definition.connector?.targetCardinality,

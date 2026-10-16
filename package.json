@@ -21,6 +21,8 @@
     "test:usecase": "npx tsx src/engine/shapes/__tests__/usecase.test.mjs",
     "test:class": "npx tsx src/engine/shapes/__tests__/class.test.mjs",
     "test:sequence": "npx tsx src/engine/shapes/__tests__/sequence.test.mjs",
+    "test:erd": "npx tsx src/engine/shapes/__tests__/erd.test.mjs",
+    "test:collab": "npx tsx src/store/__tests__/collab.test.mjs",
     "test:pen-browser": "node scripts/verify-pen-browser.mjs",
     "lint": "eslint .",
     "preview": "vite preview",

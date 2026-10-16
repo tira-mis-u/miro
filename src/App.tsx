@@ -6,7 +6,7 @@ import {
   ImageIcon, Undo2, Redo2, ZoomIn, ZoomOut, Maximize2,
   Share2, Play, Timer, Video, MessageSquare, MoreHorizontal,
   Copy, Trash2, Palette, X, ChevronDown, Check, Search,
-  Code, Calculator, LassoSelect, Star, Clock
+  Code, Calculator, LassoSelect, Star, Clock, Database, Plus, ArrowUp, ArrowDown, Smile
 } from 'lucide-react';
 import { CanvasEngine, getConnectorRoute, isFixedShapeLabel } from './engine/CanvasEngine';
 import type { ToolType, StickyShape, AnyShape } from './engine/CanvasEngine';
@@ -14,7 +14,8 @@ import { listShapePickerDefinitions, getShapeDefinition, getShapeDefinitionForLe
 import { geometryCommandsToSvg, shapePreviewGeometry, UML_BOUNDARY_TITLE_HEIGHT } from './engine/shapes/geometry';
 import { buildConnectorPreviewGeometry, connectorDisplayLabel } from './engine/shapes/connectors';
 import { SHAPE_CATEGORIES } from './engine/shapes/types';
-import type { Cardinality, DiagramShape, EndpointMarker, SequenceFragmentData, SequenceFragmentOperator, ShapeCategory, ShapeDefinition, ShapeParameterMetadata, ShapeParameterValue, StrokeStyle, UMLClassifierData, UMLClassifierMember, UMLDiagramFamily, UMLExtensionPoint, UMLInstanceData, UMLInstanceValue, UMLSubjectBoundaryData, UMLUseCaseData, UMLVisibility } from './engine/shapes/types';
+import type { Cardinality, DiagramShape, EndpointMarker, SequenceFragmentData, SequenceFragmentOperator, ShapeCategory, ShapeDefinition, ShapeParameterMetadata, ShapeParameterValue, StrokeStyle, TableColumnModel, UMLClassifierData, UMLClassifierMember, UMLDiagramFamily, UMLExtensionPoint, UMLInstanceData, UMLInstanceValue, UMLSubjectBoundaryData, UMLUseCaseData, UMLVisibility } from './engine/shapes/types';
+import { generateTableDdl, type DdlDialect } from './engine/shapes/erdDdl';
 import { diagramCapabilitiesFor, familyForDefinition, UML_FAMILY_LABELS, umlFamilyForCategory } from './engine/shapes/diagramContext';
 import type { DiagramGraphDiagnostic } from './engine/shapes/diagramContext';
 import { createClassifierMember, formatOperationParameters, parseOperationParameters } from './engine/shapes/classifier';
@@ -24,6 +25,17 @@ import { getCanvasShortcutAction } from './engine/keyboardShortcuts';
 import {
   continueWithoutLocalRecovery, getBoardRuntimeStatus, initializeBoardStore, subscribeBoardRuntimeStatus, yShapes,
 } from './store/useBoardStore';
+import { RemoteCursorsOverlay } from './components/collab/RemoteCursorsOverlay';
+import {
+  broadcastCollabCursor,
+  broadcastCollabPresenter,
+  broadcastCollabReaction,
+  getCollabPeers,
+  getLocalCollabUser,
+  subscribeCollabPresence,
+  type CollabPeer,
+  type CollabUser,
+} from './store/collabPresence';
 import BoardStatusBanner from './store/BoardStatusBanner';
 import FormulaEditor from './formula/FormulaEditor';
 import FormulaEditorBoundary from './formula/FormulaEditorBoundary';
@@ -389,6 +401,92 @@ export default function App() {
   const [shapePropertiesOpen, setShapePropertiesOpen] = useState(false);
   const shapePropertiesPanelRef = useRef<HTMLElement>(null);
   const shapePropertiesTriggerRef = useRef<HTMLButtonElement>(null);
+  const [ddlModalData, setDdlModalData] = useState<{ tableName: string; columns: TableColumnModel[] } | null>(null);
+  const [ddlDialect, setDdlDialect] = useState<DdlDialect>('postgresql');
+  const [ddlCopied, setDdlCopied] = useState(false);
+
+  // Real-time Anonymous User & Presence
+  const [collabUser, setCollabUser] = useState<CollabUser | null>(() => getLocalCollabUser());
+  const collabUserRef = useRef(collabUser);
+  collabUserRef.current = collabUser;
+  const [collabPeers, setCollabPeers] = useState<CollabPeer[]>(() => getCollabPeers());
+
+  // Miro-standard Follow Collaborator Mode ("Screen Following")
+  const [followingPeerId, setFollowingPeerId] = useState<number | null>(null);
+  const followingPeerIdRef = useRef(followingPeerId);
+  followingPeerIdRef.current = followingPeerId;
+
+  // Miro-standard Presenter Mode ("Bring Everyone to Me")
+  const [isPresenting, setIsPresenting] = useState(false);
+  const isPresentingRef = useRef(isPresenting);
+  isPresentingRef.current = isPresenting;
+  const [followingPresenter, setFollowingPresenter] = useState(true);
+
+  // Live Floating Emoji Reactions
+  const [showReactionPicker, setShowReactionPicker] = useState(false);
+  const lastMouseWorldPosRef = useRef<{ x: number; y: number } | null>(null);
+
+  useEffect(() => {
+    return subscribeCollabPresence(() => {
+      setCollabUser(getLocalCollabUser());
+      setCollabPeers(getCollabPeers());
+    });
+  }, []);
+
+  const followingPeer = collabPeers.find(p => p.clientId === followingPeerId);
+  const activeRemotePresenter = collabPeers.find(p => p.presenter && p.presenter.active);
+
+  // Auto track followed collaborator's cursor/position
+  useEffect(() => {
+    if (!followingPeerId || !engRef.current) return;
+    const target = collabPeers.find(p => p.clientId === followingPeerId);
+    if (!target) {
+      setFollowingPeerId(null);
+      return;
+    }
+    if (target.cursor) {
+      engRef.current.panTo(target.cursor.x, target.cursor.y);
+    }
+  }, [followingPeerId, collabPeers]);
+
+  // Auto track remote presenter's camera
+  useEffect(() => {
+    if (!activeRemotePresenter?.presenter || !followingPresenter || !engRef.current) return;
+    const p = activeRemotePresenter.presenter;
+    engRef.current.setCamera(p.x, p.y, p.zoom);
+  }, [activeRemotePresenter?.presenter, followingPresenter]);
+
+  const togglePresenting = useCallback(() => {
+    setIsPresenting(prev => {
+      const next = !prev;
+      if (next) {
+        if (engRef.current && collabUserRef.current) {
+          broadcastCollabPresenter({
+            active: true,
+            x: Math.round(engRef.current.cam.x * 10) / 10,
+            y: Math.round(engRef.current.cam.y * 10) / 10,
+            zoom: Math.round(engRef.current.cam.zoom * 100) / 100,
+            presenterName: collabUserRef.current.name,
+          });
+        }
+      } else {
+        broadcastCollabPresenter(null);
+      }
+      return next;
+    });
+  }, []);
+
+  const handleSendReaction = useCallback((emoji: string) => {
+    const eng = engRef.current;
+    let worldPos = lastMouseWorldPosRef.current;
+    if (!worldPos && eng) {
+      worldPos = eng.clientToWorld(window.innerWidth / 2, window.innerHeight / 2);
+    }
+    if (worldPos) {
+      broadcastCollabReaction(emoji, worldPos);
+    }
+    setShowReactionPicker(false);
+  }, []);
 
   // text/sticky edit overlay
   const [editShape, setEditShape] = useState<AnyShape | null>(null);
@@ -717,6 +815,7 @@ export default function App() {
     // Apply the current UI values at construction so new shapes use Antiwhite defaults.
     eng.style = { ...engineStyleRef.current };
     engRef.current = eng;
+    (window as unknown as { eng?: CanvasEngine }).eng = eng;
 
     eng.onSel = ids => {
       setSelIds(ids);
@@ -733,8 +832,35 @@ export default function App() {
     eng.onGraphUpdate = diagnostics => setGraphDiagnostics(diagnostics);
     setGraphDiagnostics(eng.getDiagramGraphDiagnostics());
     eng.onCursor = setCursor;
-    eng.onCameraChange = (c) => { setCam(c); setZoom(c.zoom); };
-    eng.onZoom = (z) => { setZoom(z); setCam(prev => ({ ...prev, zoom: z })); };
+    eng.onCameraChange = (c) => {
+      setCam(c);
+      setZoom(c.zoom);
+      if (isPresentingRef.current && collabUserRef.current) {
+        broadcastCollabPresenter({
+          active: true,
+          x: Math.round(c.x * 10) / 10,
+          y: Math.round(c.y * 10) / 10,
+          zoom: Math.round(c.zoom * 100) / 100,
+          presenterName: collabUserRef.current.name,
+        });
+      }
+    };
+    eng.onZoom = (z) => {
+      setZoom(z);
+      setCam(prev => {
+        const next = { ...prev, zoom: z };
+        if (isPresentingRef.current && collabUserRef.current) {
+          broadcastCollabPresenter({
+            active: true,
+            x: Math.round(next.x * 10) / 10,
+            y: Math.round(next.y * 10) / 10,
+            zoom: Math.round(z * 100) / 100,
+            presenterName: collabUserRef.current.name,
+          });
+        }
+        return next;
+      });
+    };
     eng.onTool = t => {
       setToolSt(t);
       if (t === 'select' || t === 'lasso-select') setLastSelectTool(t);
@@ -861,7 +987,7 @@ export default function App() {
           boxW = localBounds.w * eng.cam.zoom;
           boxH = localBounds.h * eng.cam.zoom;
           text = shape.text || def.defaultText || 'Use Case';
-        } else if (def?.id === 'erd.er-table' || def?.id === 'erd.table') {
+        } else if (def?.id === 'erd.er-table' || def?.id === 'erd.table' || def?.id === 'erd.view') {
           const hit = eng.getErTableHit(shape.id, cx, cy);
           if (hit) {
             boxL = hit.clientBounds.l;
@@ -975,6 +1101,24 @@ export default function App() {
           boxH = localBounds.h * eng.cam.zoom;
           boxL = sp.x + 8 * eng.cam.zoom;
           boxW = localBounds.w * eng.cam.zoom;
+        } else if (def?.geometry === 'diamond' || def?.geometry === 'associativeEntity') {
+          const isIdentifying = shape.params?.doubleBorder === true;
+          const safeW = shape.w * (isIdentifying ? 0.72 : 0.78);
+          const safeH = shape.h * (isIdentifying ? 0.58 : 0.64);
+          localBounds = { x: (shape.w - safeW) / 2, y: (shape.h - safeH) / 2, w: safeW, h: safeH };
+          boxL = sp.x + localBounds.x * eng.cam.zoom;
+          boxT = sp.y + localBounds.y * eng.cam.zoom;
+          boxW = localBounds.w * eng.cam.zoom;
+          boxH = localBounds.h * eng.cam.zoom;
+        } else if (def?.geometry === 'ellipse') {
+          const isDouble = shape.params?.doubleBorder === true;
+          const safeW = shape.w * (isDouble ? 0.72 : 0.80);
+          const safeH = shape.h * (isDouble ? 0.64 : 0.72);
+          localBounds = { x: (shape.w - safeW) / 2, y: (shape.h - safeH) / 2, w: safeW, h: safeH };
+          boxL = sp.x + localBounds.x * eng.cam.zoom;
+          boxT = sp.y + localBounds.y * eng.cam.zoom;
+          boxW = localBounds.w * eng.cam.zoom;
+          boxH = localBounds.h * eng.cam.zoom;
         }
       }
 
@@ -1017,6 +1161,7 @@ export default function App() {
       const target = e.target as HTMLElement | null;
       if (target?.closest('.no-canvas, .panel-ui, .toolbar, .popover, .formula-editor-panel, .math-tools-panel, .code-editor-shell, .board-sticky-overlay, .board-code-preview, input, textarea, select, [contenteditable="true"], [role="dialog"]')) return;
       if (!e.deltaY) return;
+      if (followingPeerIdRef.current) setFollowingPeerId(null);
       const unit = e.deltaMode === WheelEvent.DOM_DELTA_LINE ? 16 : e.deltaMode === WheelEvent.DOM_DELTA_PAGE ? wrap.clientHeight : 1;
       const delta = Math.max(-160, Math.min(160, e.deltaY * unit));
       const factor = Math.max(0.8, Math.min(1.25, Math.exp(-delta * 0.00125)));
@@ -1026,10 +1171,32 @@ export default function App() {
     wrap.addEventListener('wheel', onWheel, { passive: false });
 
     // Window listeners keep drawing, erasing, and panning coherent outside the canvas bounds.
-    const onMove = (e: PointerEvent) => eng.pointerMove(e);
+    const onMove = (e: PointerEvent) => {
+      eng.pointerMove(e);
+      if (wrap) {
+        const rect = wrap.getBoundingClientRect();
+        if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
+          const world = eng.clientToWorld(e.clientX, e.clientY);
+          lastMouseWorldPosRef.current = world;
+          broadcastCollabCursor(world);
+        } else {
+          broadcastCollabCursor(null);
+        }
+      }
+    };
     const onUp = (e: PointerEvent) => eng.pointerUp(e);
-    const onCancel = (e: PointerEvent) => eng.cancelPointer(e);
-    const onBlur = () => eng.cancelPointer();
+    const onCancel = (e: PointerEvent) => {
+      eng.cancelPointer(e);
+      broadcastCollabCursor(null);
+    };
+    const onBlur = () => {
+      eng.cancelPointer();
+      broadcastCollabCursor(null);
+    };
+    const onLeave = () => {
+      broadcastCollabCursor(null);
+    };
+    wrap.addEventListener('pointerleave', onLeave);
     window.addEventListener('pointermove', onMove);
     window.addEventListener('pointerup', onUp);
     window.addEventListener('pointercancel', onCancel);
@@ -1047,6 +1214,7 @@ export default function App() {
       ro.disconnect();
       window.removeEventListener('mousedown', h, true);
       wrap.removeEventListener('wheel', onWheel);
+      wrap.removeEventListener('pointerleave', onLeave);
       window.removeEventListener('pointermove', onMove);
       window.removeEventListener('pointerup', onUp);
       window.removeEventListener('pointercancel', onCancel);
@@ -1054,6 +1222,7 @@ export default function App() {
       eng.cancelPointer();
       eng.destroy();
       engRef.current = null;
+      (window as unknown as { eng?: CanvasEngine | null }).eng = null;
     };
   }, [boardReady]);
 
@@ -1263,6 +1432,105 @@ export default function App() {
     });
   }, [commitEdit]);
 
+  const commitAndAdvanceErTableColumn = useCallback(() => {
+    const shape = editShapeRef.current;
+    const eng = engRef.current;
+    const erContext = editingErContextRef.current;
+    if (!shape || !eng || !erContext || erContext.target === 'header' || erContext.columnIndex === undefined) {
+      commitEdit();
+      return;
+    }
+
+    const currentText = editTextRef.current;
+    let nextIdx = erContext.columnIndex + 1;
+
+    if (!currentText.trim()) {
+      eng.removeErTableColumn(shape.id, erContext.columnIndex);
+      nextIdx = erContext.columnIndex;
+    } else {
+      eng.updateErTableColumn(shape.id, erContext.columnIndex, currentText);
+    }
+
+    const insertedIdx = eng.addErTableColumn(shape.id, nextIdx, 'column_name : varchar(255)');
+    if (insertedIdx === null) {
+      commitEdit();
+      return;
+    }
+
+    const nextBounds = eng.getErTableColumnBounds(shape.id, insertedIdx);
+    if (!nextBounds) {
+      commitEdit();
+      return;
+    }
+
+    const updatedShape = eng.getShape(shape.id);
+    if (updatedShape) internalSetEditShape(updatedShape);
+
+    editingErContextRef.current = {
+      shapeId: shape.id,
+      target: 'column',
+      columnIndex: insertedIdx,
+      fontSize: nextBounds.fontSize,
+    };
+    editingLocalBoundsRef.current = nextBounds.localBounds;
+
+    editTextRef.current = nextBounds.initialText;
+    setEditText(nextBounds.initialText);
+    setEditBox(nextBounds.clientBounds);
+
+    window.requestAnimationFrame(() => {
+      const textarea = document.querySelector<HTMLTextAreaElement>('.board-text-editor');
+      if (textarea) {
+        textarea.focus();
+        textarea.select();
+      }
+    });
+  }, [commitEdit]);
+
+  const navigateErTableColumn = useCallback((direction: 'up' | 'down') => {
+    const shape = editShapeRef.current;
+    const eng = engRef.current;
+    const erContext = editingErContextRef.current;
+    if (!shape || !eng || !erContext || erContext.target === 'header' || erContext.columnIndex === undefined) {
+      return false;
+    }
+
+    const currentText = editTextRef.current;
+    if (currentText.trim()) {
+      eng.updateErTableColumn(shape.id, erContext.columnIndex, currentText);
+    }
+
+    const targetIdx = direction === 'up' ? erContext.columnIndex - 1 : erContext.columnIndex + 1;
+    const nextBounds = eng.getErTableColumnBounds(shape.id, targetIdx);
+    if (!nextBounds) {
+      return false;
+    }
+
+    const updatedShape = eng.getShape(shape.id);
+    if (updatedShape) internalSetEditShape(updatedShape);
+
+    editingErContextRef.current = {
+      shapeId: shape.id,
+      target: 'column',
+      columnIndex: targetIdx,
+      fontSize: nextBounds.fontSize,
+    };
+    editingLocalBoundsRef.current = nextBounds.localBounds;
+
+    editTextRef.current = nextBounds.initialText;
+    setEditText(nextBounds.initialText);
+    setEditBox(nextBounds.clientBounds);
+
+    window.requestAnimationFrame(() => {
+      const textarea = document.querySelector<HTMLTextAreaElement>('.board-text-editor');
+      if (textarea) {
+        textarea.focus();
+        textarea.select();
+      }
+    });
+    return true;
+  }, []);
+
   // Keyboard context priority: native editor/form controls first, then application dialogs and
   // toolbars, then the focused board. A text editor's native history/select-all must never reach
   // the board's Yjs history manager.
@@ -1393,7 +1661,7 @@ export default function App() {
   const classifierCompartments = Array.isArray(classifierModel?.compartments) ? classifierModel.compartments : [];
   const instanceModel = selectedDiagram?.data?.instance as UMLInstanceData | undefined;
   const instanceValues = Array.isArray(instanceModel?.values) ? instanceModel.values : [];
-  const tableModel = selectedDiagram?.data?.table as { columns?: Array<{ id?: string; name?: string; type?: string; key?: string }> } | undefined;
+  const tableModel = selectedDiagram?.data?.table as { columns?: Array<TableColumnModel> } | undefined;
   const tableColumns = Array.isArray(tableModel?.columns) ? tableModel.columns : [];
   const columnModel = selectedDiagram?.data?.column as { name?: string; type?: string; key?: string } | undefined;
   const sequenceFragment = selectedDiagram?.shapeId === 'uml.frame'
@@ -1464,8 +1732,91 @@ export default function App() {
     updateInstanceData({ ...instanceModel, values: [...instanceModel.values,
       createClassifierMember('values', instanceModel.values.length) as UMLInstanceValue] }, true);
   };
-  const updateTableData = (columns: Array<{ id?: string; name?: string; type?: string; key?: string }>, commit = false) => {
-    if (selectedDiagram) engRef.current?.updateDiagramData(selectedDiagram.id, { table: { ...(tableModel ?? {}), columns } }, commit);
+  const updateTableData = (columns: Array<{ id?: string; name?: string; type?: string; key?: string; nullable?: boolean; default?: string }>, commit = false) => {
+    if (selectedDiagram) {
+      engRef.current?.updateDiagramData(selectedDiagram.id, { table: { ...(tableModel ?? {}), columns } }, commit);
+      if (commit) {
+        const neededHeight = Math.max(selectedDiagram.h, (columns.length + 1) * 32);
+        if (neededHeight > selectedDiagram.h) {
+          engRef.current?.updateSize(selectedDiagram.id, selectedDiagram.w, neededHeight);
+        }
+      }
+    }
+  };
+
+  const addTableColumn = () => {
+    const newCol: TableColumnModel = {
+      id: `column-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      name: `column_${tableColumns.length + 1}`,
+      type: 'varchar(255)',
+      key: 'none',
+      nullable: true,
+    };
+    updateTableData([...tableColumns, newCol], true);
+  };
+
+  const addSurrogateIdKey = () => {
+    const hasPk = tableColumns.some(col => col.key === 'primary' || col.key === 'primary_foreign');
+    if (hasPk) return;
+    const idCol: TableColumnModel = {
+      id: `col-id-${Date.now()}`,
+      name: 'id',
+      type: 'bigint',
+      key: 'primary',
+      nullable: false,
+    };
+    updateTableData([idCol, ...tableColumns], true);
+  };
+
+  const addTimestampsPreset = () => {
+    const existingNames = new Set(tableColumns.map(col => col.name?.toLowerCase()));
+    const toAdd: TableColumnModel[] = [];
+    if (!existingNames.has('created_at')) {
+      toAdd.push({
+        id: `col-created-at-${Date.now()}`,
+        name: 'created_at',
+        type: 'timestamp',
+        key: 'none',
+        nullable: false,
+        default: 'CURRENT_TIMESTAMP',
+      });
+    }
+    if (!existingNames.has('updated_at')) {
+      toAdd.push({
+        id: `col-updated-at-${Date.now()}`,
+        name: 'updated_at',
+        type: 'timestamp',
+        key: 'none',
+        nullable: false,
+        default: 'CURRENT_TIMESTAMP',
+      });
+    }
+    if (toAdd.length > 0) {
+      updateTableData([...tableColumns, ...toAdd], true);
+    }
+  };
+
+  const addSoftDeletePreset = () => {
+    const existingNames = new Set(tableColumns.map(col => col.name?.toLowerCase()));
+    if (!existingNames.has('deleted_at')) {
+      const col: TableColumnModel = {
+        id: `col-deleted-at-${Date.now()}`,
+        name: 'deleted_at',
+        type: 'timestamp',
+        key: 'none',
+        nullable: true,
+      };
+      updateTableData([...tableColumns, col], true);
+    }
+  };
+
+  const moveTableColumn = (index: number, delta: -1 | 1) => {
+    const target = index + delta;
+    if (target < 0 || target >= tableColumns.length) return;
+    const updated = [...tableColumns];
+    const [moved] = updated.splice(index, 1);
+    updated.splice(target, 0, moved);
+    updateTableData(updated, true);
   };
   const updateColumnData = (column: { name?: string; type?: string; key?: string }, commit = false) => {
     if (selectedDiagram) engRef.current?.updateDiagramData(selectedDiagram.id, { column }, commit);
@@ -1590,34 +1941,133 @@ export default function App() {
 
         <div className="header-spacer" />
 
-        <div className="header-presence" role="img" aria-label="Collaborators presence">
-          <div className="presence-avatars" aria-hidden="true">
-            <div className="presence-avatar" style={{ background: 'linear-gradient(135deg, #6366f1, #4338ca)', zIndex: 3 }} title="Alex Rivera (Active)">AR</div>
-            <div className="presence-avatar" style={{ background: 'linear-gradient(135deg, #10b981, #059669)', zIndex: 2 }} title="Sarah Chen (Active)">SC</div>
-            <div className="presence-avatar" style={{ background: 'linear-gradient(135deg, #f59e0b, #d97706)', zIndex: 1 }} title="David Kim (Active)">DK</div>
-          </div>
-          <span className="presence-badge">+2</span>
+        <div className="header-presence" role="region" aria-label="Online collaborators">
+          {collabPeers.length === 0 ? (
+            <div className="presence-alone-indicator" title="You are currently the only collaborator in this room">
+              <span className="presence-alone-dot" />
+              <span className="presence-alone-label">Solo</span>
+            </div>
+          ) : (
+            <div className="presence-avatars">
+              {collabPeers.slice(0, 4).map((peer, idx) => {
+                const isFollowed = followingPeerId === peer.clientId;
+                return (
+                  <button
+                    key={peer.clientId}
+                    type="button"
+                    className={`presence-avatar ${isFollowed ? 'is-following' : ''}`}
+                    style={{
+                      background: peer.user.gradient,
+                      zIndex: collabPeers.length - idx,
+                      border: isFollowed ? '2px solid #3b82f6' : '2px solid #ffffff',
+                      cursor: 'pointer',
+                    }}
+                    title={`${peer.user.name} (Active) — ${isFollowed ? 'Click to stop following' : 'Click to follow screen'}`}
+                    aria-label={`${peer.user.name} — ${isFollowed ? 'Stop following' : 'Follow screen'}`}
+                    aria-pressed={isFollowed}
+                    onClick={() => {
+                      if (isFollowed) {
+                        setFollowingPeerId(null);
+                      } else {
+                        setFollowingPeerId(peer.clientId);
+                        if (peer.cursor && engRef.current) {
+                          engRef.current.panTo(peer.cursor.x, peer.cursor.y);
+                        }
+                      }
+                    }}
+                  >
+                    {peer.user.avatarLabel}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+          {collabPeers.length > 4 && (
+            <span className="presence-badge" title={`${collabPeers.length - 4} more collaborators online`}>
+              +{collabPeers.length - 4}
+            </span>
+          )}
         </div>
 
         <span className="header-action-divider" aria-hidden="true" />
 
         <div className="header-actions">
-          <button type="button" disabled title="Presentation is not available yet" aria-label="Present (not available yet)"
-            className="header-action header-action-secondary">
+          <button
+            type="button"
+            onClick={togglePresenting}
+            title={isPresenting ? 'Stop presenting board to collaborators' : 'Present board to everyone (Bring everyone to me)'}
+            aria-label={isPresenting ? 'Stop presenting' : 'Start presenting'}
+            aria-pressed={isPresenting}
+            className={`header-action header-action-secondary ${isPresenting ? 'is-presenting' : ''}`}
+          >
             <Play size={13} strokeWidth={2.4} className="fill-current" />
-            <span className="header-action-label">Present</span>
+            <span className="header-action-label">{isPresenting ? 'Stop' : 'Present'}</span>
           </button>
           <button type="button" disabled title="Sharing is not available yet" aria-label="Share (not available yet)"
             className="header-action header-action-share">
             <Share2 size={13} strokeWidth={2.4} />
             <span className="header-action-label">Share</span>
           </button>
-          <div className="header-user-avatar" title="Your Profile (Online)" aria-hidden="true">
-            <span>U</span>
+          <div
+            className="header-user-avatar"
+            style={{
+              background: collabUser ? collabUser.gradient : 'linear-gradient(135deg, #2563eb, #1d4ed8)',
+              color: '#ffffff',
+            }}
+            title={collabUser ? `You (${collabUser.name}) — Online` : 'Connecting...'}
+            aria-label={collabUser ? `You (${collabUser.name}) — Online` : 'Connecting...'}
+          >
+            <span>{collabUser ? collabUser.avatarLabel : 'U'}</span>
             <span className="header-user-online-dot" />
           </div>
         </div>
       </header>
+
+      {/* Miro-style Collaborative Follow & Presenter Floating Overlays */}
+      {followingPeer && (
+        <div className="following-collab-pill" role="status" aria-live="polite">
+          <span className="following-pulse-dot" style={{ backgroundColor: followingPeer.user.color }} />
+          <span>Following <strong>{followingPeer.user.name}</strong></span>
+          <button
+            type="button"
+            className="following-stop-btn"
+            onClick={() => setFollowingPeerId(null)}
+            aria-label="Stop following collaborator"
+          >
+            Stop
+          </button>
+        </div>
+      )}
+
+      {isPresenting && (
+        <div className="presenting-indicator-pill" role="status" aria-live="polite">
+          <span className="presenting-pulse-dot" />
+          <span>You are presenting to everyone</span>
+          <button
+            type="button"
+            className="presenting-stop-btn"
+            onClick={togglePresenting}
+            aria-label="Stop presenting"
+          >
+            Stop
+          </button>
+        </div>
+      )}
+
+      {!isPresenting && activeRemotePresenter?.presenter && followingPresenter && (
+        <div className="presenting-indicator-pill" role="status" aria-live="polite">
+          <span className="presenting-pulse-dot" />
+          <span><strong>{activeRemotePresenter.user.name}</strong> is presenting</span>
+          <button
+            type="button"
+            className="presenting-stop-btn"
+            onClick={() => setFollowingPresenter(false)}
+            aria-label="Leave presentation"
+          >
+            Leave
+          </button>
+        </div>
+      )}
 
       {/* ══ BODY ════════════════════════════════════════════════════════════ */}
       <div className="flex flex-1 min-h-0 overflow-hidden">
@@ -1851,6 +2301,7 @@ export default function App() {
               const rect = sticky.getBoundingClientRect();
               if (e.clientX >= rect.right - 20) return;
             }
+            if (followingPeerIdRef.current) setFollowingPeerId(null);
             eng.pointerDown(e.nativeEvent);
           }}
           onDoubleClick={e => engRef.current?.doubleClick(e.nativeEvent)}
@@ -1865,6 +2316,8 @@ export default function App() {
             aria-label="Whiteboard canvas. Use the tool rail or keyboard shortcuts to choose tools. Right-drag to pan, scroll to zoom at the pointer, and use arrow keys to pan when no object is selected."
             style={{ cursor: renderedCursor, position: 'absolute', inset: 0, width: '100%', height: '100%', display: 'block', touchAction: 'none' }}
           />
+
+          <RemoteCursorsOverlay engine={engRef.current} camera={cam} />
 
           {(!boardReady || boardRestoreError) && (
             <div role={boardRestoreError ? 'alert' : 'status'} aria-live="polite" style={{ position: 'absolute', inset: 0, zIndex: 2000,
@@ -2012,7 +2465,38 @@ export default function App() {
                     }}
                     onBlur={() => commitEdit()}
                     onKeyDown={event => {
-                      if (event.key === 'Escape') { event.preventDefault(); commitEdit(); }
+                      if (event.key === 'Escape') { event.preventDefault(); commitEdit(); return; }
+                      if (editingErContextRef.current && editingErContextRef.current.target === 'column') {
+                        if (event.key === 'Enter' && !event.shiftKey) {
+                          event.preventDefault();
+                          commitAndAdvanceErTableColumn();
+                          return;
+                        }
+                        if (event.key === 'Tab') {
+                          event.preventDefault();
+                          if (event.shiftKey) {
+                            navigateErTableColumn('up');
+                          } else {
+                            const advanced = navigateErTableColumn('down');
+                            if (!advanced) {
+                              commitAndAdvanceErTableColumn();
+                            }
+                          }
+                          return;
+                        }
+                        if (event.key === 'ArrowUp') {
+                          if (navigateErTableColumn('up')) {
+                            event.preventDefault();
+                            return;
+                          }
+                        }
+                        if (event.key === 'ArrowDown') {
+                          if (navigateErTableColumn('down')) {
+                            event.preventDefault();
+                            return;
+                          }
+                        }
+                      }
                       if (event.key === 'Enter' && !event.shiftKey && editShape.type === 'diagram'
                         && !['uml.note', 'uml.use-case-ext'].includes((editShape as DiagramShape).shapeId)) {
                         event.preventDefault();
@@ -2032,13 +2516,11 @@ export default function App() {
                         || (editingErContextRef.current && editingErContextRef.current.target === 'column')
                         || (editingUsecaseExtContextRef.current && editingUsecaseExtContextRef.current.target === 'extension-points')
                         ? '#ffffff'
-                        : editShape.type === 'diagram'
-                        ? 'rgba(255, 255, 255, 0.92)'
                         : 'transparent',
                       fontSize: editingClassifierContextRef.current
-                        ? Math.round(editingClassifierContextRef.current.fontSize * zoom)
+                        ? editingClassifierContextRef.current.fontSize
                         : editingErContextRef.current?.fontSize
-                        ? Math.round(editingErContextRef.current.fontSize * zoom)
+                        ? editingErContextRef.current.fontSize
                         : shapeFontSize(editShape),
                       padding: (editingClassifierContextRef.current && editingClassifierContextRef.current.target !== 'header')
                         || (editingErContextRef.current && editingErContextRef.current.target === 'column')
@@ -2058,6 +2540,12 @@ export default function App() {
                         ? '4px 6px'
                         : editShape.type === 'diagram' && ['uml.package', 'uml.module', 'uml.frame'].includes((editShape as DiagramShape).shapeId)
                         ? '2px 6px'
+                        : editShape.type === 'diagram' && (
+                            ['erd.identifying-relationship', 'erd.relationship', 'erd.entity', 'erd.weak-entity', 'erd.associative-entity'].includes((editShape as DiagramShape).shapeId)
+                            || getShapeDefinition((editShape as DiagramShape).shapeId)?.geometry === 'diamond'
+                            || getShapeDefinition((editShape as DiagramShape).shapeId)?.geometry === 'ellipse'
+                          )
+                        ? `${Math.max(2, (editBox.h / zoom - shapeFontSize(editShape) * 1.35) / 2)}px 6px`
                         : editShape.type === 'diagram' && (editShape as DiagramShape).shapeId === 'uml.note'
                         ? '8px 8px'
                         : editShape.type === 'sticky'
@@ -2078,8 +2566,6 @@ export default function App() {
                         || (editingErContextRef.current && editingErContextRef.current.target === 'column')
                         || (editingUsecaseExtContextRef.current && editingUsecaseExtContextRef.current.target === 'extension-points')
                         ? '1.5px solid #2563eb'
-                        : editShape.type === 'diagram'
-                        ? '1.5px dashed #3b82f6'
                         : 'none',
                       borderRadius: 3,
                       boxShadow: (editingClassifierContextRef.current && editingClassifierContextRef.current.target !== 'header')
@@ -2092,11 +2578,16 @@ export default function App() {
                         : editingErContextRef.current && editingErContextRef.current.target === 'column' ? 'left'
                         : editShape.type === 'diagram' && ['uml.note', 'uml.package', 'uml.module', 'uml.frame'].includes((editShape as DiagramShape).shapeId)
                         ? 'left'
-                        : isFixedShapeLabel(editShape) || (editShape.type === 'diagram' && [
-                            'uml.system-boundary', 'uml.actor', 'uml.use-case',
-                            'uml.lifeline', 'uml.sequence-actor', 'uml.boundary', 'uml.control', 'uml.entity',
-                            'uml.class', 'uml.abstract-class', 'uml.interface', 'uml.enumeration', 'uml.object'
-                          ].includes((editShape as DiagramShape).shapeId)) ? 'center' : 'left',
+                        : isFixedShapeLabel(editShape) || (editShape.type === 'diagram' && (
+                            [
+                              'uml.system-boundary', 'uml.actor', 'uml.use-case',
+                              'uml.lifeline', 'uml.sequence-actor', 'uml.boundary', 'uml.control', 'uml.entity',
+                              'uml.class', 'uml.abstract-class', 'uml.interface', 'uml.enumeration', 'uml.object',
+                              'erd.identifying-relationship', 'erd.relationship', 'erd.entity', 'erd.weak-entity', 'erd.associative-entity'
+                            ].includes((editShape as DiagramShape).shapeId)
+                            || getShapeDefinition((editShape as DiagramShape).shapeId)?.geometry === 'diamond'
+                            || getShapeDefinition((editShape as DiagramShape).shapeId)?.geometry === 'ellipse'
+                          )) ? 'center' : 'left',
                       overflowY: editShape.type === 'sticky' ? 'auto' : 'hidden',
                     }}
                   />
@@ -2433,26 +2924,138 @@ export default function App() {
                   </section>}
 
                   {selectedDefinition.dataCapabilities?.includes('table') && Array.isArray(tableModel?.columns) && <section className="shape-property-section">
-                    <h4>Table columns</h4>
-                    {tableColumns.map((column, index) => <div className="shape-property-column" key={column.id ?? index}>
-                      <div className="shape-property-column-fields">
-                        <input aria-label={`Column ${index + 1} name`} value={column.name ?? ''} placeholder="column name"
+                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                      <h4>Table columns ({tableColumns.length})</h4>
+                      <button
+                        type="button"
+                        className="shape-preset-btn is-action"
+                        onClick={() => {
+                          const tableName = selectedDiagram?.text || selectedDefinition?.label || 'my_table';
+                          setDdlModalData({ tableName, columns: tableColumns as TableColumnModel[] });
+                        }}
+                        title="Generate SQL DDL (PostgreSQL, MySQL, SQLite)"
+                      >
+                        <Database size={11} />
+                        SQL DDL
+                      </button>
+                    </div>
+
+                    <div className="shape-property-presets">
+                      <button type="button" className="shape-preset-btn" onClick={addTableColumn}>
+                        <Plus size={11} /> Column
+                      </button>
+                      <button
+                        type="button"
+                        className="shape-preset-btn"
+                        onClick={addSurrogateIdKey}
+                        disabled={tableColumns.some(col => col.key === 'primary' || col.key === 'primary_foreign')}
+                        title={tableColumns.some(col => col.key === 'primary' || col.key === 'primary_foreign') ? 'Table already has a primary key' : 'Add surrogate id (bigint PK)'}
+                      >
+                        + ID (PK)
+                      </button>
+                      <button type="button" className="shape-preset-btn" onClick={addTimestampsPreset} title="Add created_at and updated_at timestamps">
+                        + Timestamps
+                      </button>
+                      <button type="button" className="shape-preset-btn" onClick={addSoftDeletePreset} title="Add deleted_at nullable timestamp">
+                        + Soft Delete
+                      </button>
+                    </div>
+
+                    <datalist id="sql-column-types-datalist">
+                      <option value="bigint" />
+                      <option value="integer" />
+                      <option value="smallint" />
+                      <option value="serial" />
+                      <option value="varchar(255)" />
+                      <option value="varchar(100)" />
+                      <option value="text" />
+                      <option value="boolean" />
+                      <option value="timestamp" />
+                      <option value="timestamptz" />
+                      <option value="date" />
+                      <option value="time" />
+                      <option value="numeric(12,2)" />
+                      <option value="decimal(10,2)" />
+                      <option value="uuid" />
+                      <option value="jsonb" />
+                      <option value="json" />
+                    </datalist>
+
+                    {tableColumns.map((column, index) => <div className="shape-property-column" key={column.id ?? index} style={{ marginBottom: 6 }}>
+                      <div className="shape-property-column-fields-v2">
+                        <input aria-label={`Column ${index + 1} name`} value={column.name ?? ''} placeholder="column_name"
                           onChange={event => updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? { ...item, name: event.target.value } : item), false)}
                           onBlur={() => updateTableData(tableColumns, true)} />
-                        <input aria-label={`Column ${index + 1} type`} value={column.type ?? ''} placeholder="type"
+                        <input aria-label={`Column ${index + 1} type`} value={column.type ?? ''} placeholder="varchar(255)"
+                          list="sql-column-types-datalist"
                           onChange={event => updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? { ...item, type: event.target.value } : item), false)}
                           onBlur={() => updateTableData(tableColumns, true)} />
                         <select aria-label={`Column ${index + 1} key type`} value={column.key ?? 'none'}
-                          onChange={event => updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? { ...item, key: event.target.value } : item), true)}>
-                          <option value="none">No key</option><option value="primary">Primary key</option><option value="foreign">Foreign key</option>
+                          onChange={event => {
+                            const newKey = event.target.value;
+                            const autoNotNull = newKey === 'primary' || newKey === 'primary_foreign';
+                            updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? {
+                              ...item,
+                              key: newKey,
+                              nullable: autoNotNull ? false : item.nullable,
+                            } : item), true);
+                          }}>
+                          <option value="none">Regular</option>
+                          <option value="primary">PK</option>
+                          <option value="foreign">FK</option>
+                          <option value="primary_foreign">PK, FK</option>
+                          <option value="unique">UK</option>
                         </select>
+                        <div className="shape-property-column-subfields">
+                          <label title="Not Null constraint">
+                            <input
+                              type="checkbox"
+                              checked={column.nullable === false || column.key === 'primary' || column.key === 'primary_foreign'}
+                              disabled={column.key === 'primary' || column.key === 'primary_foreign'}
+                              onChange={event => updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? { ...item, nullable: !event.target.checked } : item), true)}
+                            />
+                            <span>NN</span>
+                          </label>
+                          <input
+                            type="text"
+                            placeholder="DEFAULT expr"
+                            value={column.default ?? ''}
+                            title="Default expression (e.g. CURRENT_TIMESTAMP, 0, 'active')"
+                            onChange={event => updateTableData(tableColumns.map((item, itemIndex) => itemIndex === index ? { ...item, default: event.target.value } : item), false)}
+                            onBlur={() => updateTableData(tableColumns, true)}
+                          />
+                        </div>
                       </div>
-                      <button type="button" onClick={() => updateTableData(tableColumns.filter((_, itemIndex) => itemIndex !== index), true)}
-                        aria-label={`Remove column ${index + 1}`} title="Remove column"><X size={13} /></button>
+                      <div className="shape-property-column-actions">
+                        <button
+                          type="button"
+                          disabled={index === 0}
+                          onClick={() => moveTableColumn(index, -1)}
+                          title="Move column up"
+                          aria-label={`Move column ${index + 1} up`}
+                        >
+                          <ArrowUp size={11} />
+                        </button>
+                        <button
+                          type="button"
+                          disabled={index === tableColumns.length - 1}
+                          onClick={() => moveTableColumn(index, 1)}
+                          title="Move column down"
+                          aria-label={`Move column ${index + 1} down`}
+                        >
+                          <ArrowDown size={11} />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => updateTableData(tableColumns.filter((_, itemIndex) => itemIndex !== index), true)}
+                          aria-label={`Remove column ${index + 1}`}
+                          title="Remove column"
+                          style={{ color: '#ef4444' }}
+                        >
+                          <X size={11} />
+                        </button>
+                      </div>
                     </div>)}
-                    <button type="button" className="shape-property-add" onClick={() => updateTableData([...tableColumns, {
-                      id: `column-${Date.now()}`, name: `column_${tableColumns.length + 1}`, type: 'text', key: 'none',
-                    }], true)}>Add column</button>
                   </section>}
 
                   {(selectedDiagram?.shapeId === 'uml.use-case' || selectedDiagram?.shapeId === 'uml.use-case-ext') && <section className="shape-property-section uml-usecase-editor" data-uml-usecase-editor>
@@ -2736,15 +3339,46 @@ export default function App() {
               )}
             </div>
 
-            <div className="zoom-controls flex items-center bg-white rounded-lg border border-gray-200 overflow-hidden">
-              <button type="button" onClick={resetZoom} title="Reset zoom to 100%" aria-label="Reset zoom to 100 percent"
-                className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-600 transition-colors border-r border-gray-200"><Maximize2 size={14} /></button>
-              <button type="button" onClick={() => zoomBy(-0.2)} title="Zoom out" aria-label="Zoom out"
-                className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-700 transition-colors"><ZoomOut size={15} /></button>
-              <button type="button" onClick={resetZoom} aria-label={`Zoom level ${Math.round(zoom * 100)} percent; reset zoom`}
-                className="zoom-percent-button h-9 px-2 min-w-[52px] text-[12px] font-semibold text-gray-800 hover:bg-gray-50 transition-colors tabular-nums">{Math.round(zoom * 100)}%</button>
-              <button type="button" onClick={() => zoomBy(0.2)} title="Zoom in" aria-label="Zoom in"
-                className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-700 transition-colors border-l border-gray-200"><ZoomIn size={15} /></button>
+            <div className="hud-zoom-group">
+              {/* Live Floating Reaction Picker */}
+              <div className="reaction-trigger-container relative">
+                <button
+                  type="button"
+                  onClick={() => setShowReactionPicker(prev => !prev)}
+                  title="Send emoji reaction"
+                  aria-label="Send emoji reaction"
+                  aria-expanded={showReactionPicker}
+                  className="reaction-trigger-btn"
+                >
+                  <Smile size={16} strokeWidth={2} />
+                </button>
+                {showReactionPicker && (
+                  <div className="reaction-picker-bar absolute bottom-11 right-0 z-50">
+                    {['❤️', '👍', '🔥', '🎉', '🚀', '👏', '😂', '💡', '✨'].map(emoji => (
+                      <button
+                        key={emoji}
+                        type="button"
+                        className="reaction-emoji-btn"
+                        onClick={() => handleSendReaction(emoji)}
+                        aria-label={`Send ${emoji} reaction`}
+                      >
+                        {emoji}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              <div className="zoom-controls flex items-center bg-white rounded-lg border border-gray-200 overflow-hidden">
+                <button type="button" onClick={resetZoom} title="Reset zoom to 100%" aria-label="Reset zoom to 100 percent"
+                  className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-600 transition-colors border-r border-gray-200"><Maximize2 size={14} /></button>
+                <button type="button" onClick={() => zoomBy(-0.2)} title="Zoom out" aria-label="Zoom out"
+                  className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-700 transition-colors"><ZoomOut size={15} /></button>
+                <button type="button" onClick={resetZoom} aria-label={`Zoom level ${Math.round(zoom * 100)} percent; reset zoom`}
+                  className="zoom-percent-button h-9 px-2 min-w-[52px] text-[12px] font-semibold text-gray-800 hover:bg-gray-50 transition-colors tabular-nums">{Math.round(zoom * 100)}%</button>
+                <button type="button" onClick={() => zoomBy(0.2)} title="Zoom in" aria-label="Zoom in"
+                  className="zoom-control-button flex items-center justify-center hover:bg-gray-50 text-gray-700 transition-colors border-l border-gray-200"><ZoomIn size={15} /></button>
+              </div>
             </div>
           </div>
         </div>
@@ -2865,6 +3499,65 @@ export default function App() {
             </div>
           </div>
         </>
+      )}
+
+      {ddlModalData && createPortal(
+        <div className="ddl-modal-backdrop" onClick={() => setDdlModalData(null)}>
+          <div className="ddl-modal-card" onClick={e => e.stopPropagation()}>
+            <div className="ddl-modal-header">
+              <h3>
+                <Database size={16} color="#2563eb" />
+                SQL DDL Generator — {ddlModalData.tableName}
+              </h3>
+              <button
+                type="button"
+                onClick={() => setDdlModalData(null)}
+                style={{ background: 'none', border: 'none', cursor: 'pointer', color: '#64748b' }}
+                aria-label="Close DDL modal"
+              >
+                <X size={18} />
+              </button>
+            </div>
+            <div className="ddl-modal-tabs">
+              {(['postgresql', 'mysql', 'sqlite'] as const).map(d => (
+                <button
+                  key={d}
+                  type="button"
+                  className={`ddl-modal-tab ${ddlDialect === d ? 'active' : ''}`}
+                  onClick={() => setDdlDialect(d)}
+                >
+                  {d === 'postgresql' ? 'PostgreSQL' : d === 'mysql' ? 'MySQL' : 'SQLite'}
+                </button>
+              ))}
+            </div>
+            <pre className="ddl-modal-code">
+              {generateTableDdl(ddlModalData.tableName, ddlModalData.columns, ddlDialect)}
+            </pre>
+            <div className="ddl-modal-footer">
+              <button
+                type="button"
+                className="shape-preset-btn"
+                onClick={() => setDdlModalData(null)}
+              >
+                Close
+              </button>
+              <button
+                type="button"
+                className="shape-preset-btn is-action"
+                onClick={() => {
+                  const sql = generateTableDdl(ddlModalData.tableName, ddlModalData.columns, ddlDialect);
+                  navigator.clipboard.writeText(sql);
+                  setDdlCopied(true);
+                  setTimeout(() => setDdlCopied(false), 2000);
+                }}
+              >
+                {ddlCopied ? <Check size={12} /> : <Copy size={12} />}
+                {ddlCopied ? 'Copied!' : 'Copy SQL'}
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
       )}
 
       <BoardStatusBanner />

@@ -779,20 +779,30 @@ export function buildGeometryDecorations(geometry: GeometryKind, width: number, 
       result.push(line(w - fold, 0, w - fold, fold)); result.push(line(w - fold, fold, w, fold));
     }
   }
-  if (geometry === 'ellipse' && params.underline === true) {
-    const halfWidth = Math.min(w * 0.12, h * 0.40), y = cy + h * 0.16;
-    result.push(line(cx - halfWidth, y, cx + halfWidth, y));
+  if (geometry === 'ellipse' && (params.underline === true || params.underline === 'dashed')) {
+    const halfWidth = Math.min(w * 0.20, h * 0.42), y = cy + h * 0.16;
+    if (params.underline === 'dashed') {
+      const startX = cx - halfWidth, endX = cx + halfWidth;
+      const dash = 4, gap = 3;
+      for (let x = startX; x < endX; x += dash + gap) {
+        result.push(line(x, y, Math.min(x + dash, endX), y));
+      }
+    } else {
+      result.push(line(cx - halfWidth, y, cx + halfWidth, y));
+    }
   }
   if (params.doubleBorder === true || (params.innerDiamond === true && geometry === 'diamond')) {
+    const gap = Math.max(3.5, Math.min(8, Math.min(w, h) * 0.075));
     if (geometry === 'diamond') {
-      const inset = Math.min(w, h) * 0.15;
-      result.push(poly([[cx, inset], [w - inset, cy], [cx, h - inset], [inset, cy]]));
+      const dCenter = (w * h) / (2 * Math.hypot(w, h));
+      const scale = Math.max(0.45, Math.min(0.92, (dCenter - gap) / Math.max(1e-4, dCenter)));
+      const innerHalfW = cx * scale;
+      const innerHalfH = cy * scale;
+      result.push(poly([[cx, cy - innerHalfH], [cx + innerHalfW, cy], [cx, cy + innerHalfH], [cx - innerHalfW, cy]]));
     } else if (geometry === 'ellipse' || geometry === 'useCase') {
-      const inset = Math.min(w, h) * 0.10;
-      result.push(ellipsePath(cx, cy, Math.max(0.5, w / 2 - inset), Math.max(0.5, h / 2 - inset)));
+      result.push(ellipsePath(cx, cy, Math.max(0.5, w / 2 - gap), Math.max(0.5, h / 2 - gap)));
     } else {
-      const inset = Math.min(w, h) * 0.08;
-      result.push(poly([[inset, inset], [w - inset, inset], [w - inset, h - inset], [inset, h - inset]]));
+      result.push(poly([[gap, gap], [w - gap, gap], [w - gap, h - gap], [gap, h - gap]]));
     }
   }
   return result;

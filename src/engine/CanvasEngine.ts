@@ -41,7 +41,7 @@ import { compareSequenceEvents, createSequenceMessageEvent, isSequenceMessageSha
 import { normalizeExtendRelationshipData, normalizeUseCaseDiagramData } from './shapes/usecaseData';
 import { buildSolid3DProjection, normalizeSolid3DScale, projectSolid3DAxes, projectSolid3DVector, rotateSolid3DOrientationAboutLocalAxis, solid3DCameraDepth, solid3DLocalAxisSpans, solid3DScaleFromBounds, solid3DSizeGroup, solid3DRotationFrames, SOLID3D_CANVAS_INITIAL_YAW_DEGREES, SOLID3D_POSE_VERSION, type Solid3DGeometry, type Solid3DRotationAxis, type Solid3DScale } from './shapes/solid3d';
 import { connectionPointById, connectionPointsAtSequenceTime, connectionPointsForBox, connectorBounds, deserializeBoardShape, deriveStructuredShapeParameters, isDoubleClickTextEditableShape, normalizeDragBox, objectPointToWorld, persistentSequencePointId, resizeBoxFromHandle, resizeDiagramEmbeddedTextScale, rotatedBoxBounds, rotatedBoxCorners, rotatePoint, unrotatePoint, worldPointToObject } from './shapes/model';
-import type { BehavioralNodeRole, Cardinality, ConnectorShapeObject, DiagramShapeObject, EndpointIntent, EndpointMarker, EndpointSide, PathCommand, SequenceActivationData, SequenceFragmentData, SequenceLifecycleData, SequenceMessageEventData, SequenceParticipantData, ShapeConnectionPoint, ShapeDefinition, ShapeResizePolicy, UMLActivityNodeData, UMLClassifierData, UMLDiagramFamily, UMLInstanceData, UMLStatePointData, UMLStateVertexData, UMLUseCaseData } from './shapes/types';
+import type { BehavioralNodeRole, Cardinality, ConnectorShapeObject, DiagramShapeObject, EndpointIntent, EndpointMarker, EndpointSide, PathCommand, SequenceActivationData, SequenceFragmentData, SequenceLifecycleData, SequenceMessageEventData, SequenceParticipantData, ShapeConnectionPoint, ShapeDefinition, ShapeResizePolicy, TableColumnModel, UMLActivityNodeData, UMLClassifierData, UMLDiagramFamily, UMLInstanceData, UMLStatePointData, UMLStateVertexData, UMLUseCaseData } from './shapes/types';
 
 export type ToolType =
   | 'select' | 'lasso-select' | 'pen' | 'eraser'
@@ -2695,6 +2695,10 @@ export class CanvasEngine {
     this.setCamera(this.cam.x+dx/this.cam.zoom, this.cam.y+dy/this.cam.zoom, this.cam.zoom);
   }
 
+  panTo(worldX: number, worldY: number) {
+    this.setCamera(worldX, worldY, this.cam.zoom);
+  }
+
   // ─── public API ──────────────────────────────────────────────────────────
   private cursorForTool(): string {
     if (this.tool === 'select') return 'default';
@@ -3723,7 +3727,7 @@ export class CanvasEngine {
     if (!shape || shape.type !== 'diagram') return null;
     const diagram = shape as DiagramShape;
     const def = getShapeDefinition(diagram.shapeId);
-    if (!def || (def.id !== 'erd.er-table' && def.id !== 'erd.table')) return null;
+    if (!def || (def.id !== 'erd.er-table' && def.id !== 'erd.table' && def.id !== 'erd.view')) return null;
 
     const rawColumns = (diagram.data?.table as { columns?: unknown[] } | undefined)?.columns ?? (def.defaultData?.table as { columns?: unknown[] } | undefined)?.columns ?? [];
     const columns = rawColumns.filter(isRecord);
@@ -3756,11 +3760,12 @@ export class CanvasEngine {
       const idx = Math.min(columns.length - 1, Math.max(0, Math.floor((localY - layout.rowHeight) / layout.rowHeight)));
       target = 'column';
       columnIndex = idx;
-      const col = columns[idx] as { name?: string; type?: string; key?: string };
-      const key = col.key === 'primary' ? 'PK ' : col.key === 'foreign' ? 'FK ' : '';
+      const col = columns[idx] as { name?: string; type?: string; key?: string; nullable?: boolean; notNull?: boolean };
+      const key = col.key === 'primary' ? 'PK ' : col.key === 'foreign' ? 'FK ' : col.key === 'primary_foreign' ? 'PK,FK ' : col.key === 'unique' ? 'UK ' : '';
+      const notNullSuffix = col.nullable === false || col.notNull === true ? ' NOT NULL' : '';
       const name = col.name ?? `column_${idx + 1}`;
       const type = col.type ? ` : ${col.type}` : '';
-      initialText = `${key}${name}${type}`;
+      initialText = `${key}${name}${type}${notNullSuffix}`;
       localRow = { x: padX, y: (idx + 1) * layout.rowHeight, w: contentW, h: layout.rowHeight };
     }
 
@@ -3790,35 +3795,208 @@ export class CanvasEngine {
     };
   }
 
+  public getErTableColumnBounds(shapeId: string, columnIndex: number): {
+    localBounds: { x: number; y: number; w: number; h: number };
+    clientBounds: { l: number; t: number; w: number; h: number };
+    fontSize: number;
+    textAlign: 'left';
+    initialText: string;
+  } | null {
+    const shape = this.shapes.get(shapeId);
+    if (!shape || shape.type !== 'diagram') return null;
+    const diagram = shape as DiagramShape;
+    const def = getShapeDefinition(diagram.shapeId);
+    if (!def || (def.id !== 'erd.er-table' && def.id !== 'erd.table' && def.id !== 'erd.view')) return null;
+
+    const rawColumns = (diagram.data?.table as { columns?: unknown[] } | undefined)?.columns ?? (def.defaultData?.table as { columns?: unknown[] } | undefined)?.columns ?? [];
+    const columns = rawColumns.filter(isRecord);
+    if (columnIndex < 0 || columnIndex >= columns.length) return null;
+
+    const layout = structuredTableLayout(diagram.h, columns.length + 1);
+    const fontScale = Number.isFinite(diagram.embeddedTextScale) ? Math.max(0.01, Math.min(64, diagram.embeddedTextScale!)) : 1;
+    const fs = Math.max(1.25, Math.min(96, (diagram.fs ?? 14) * fontScale));
+    const padX = Math.max(8, diagram.w * 0.05);
+    const contentW = Math.max(40, diagram.w - padX * 2);
+
+    const col = columns[columnIndex] as { name?: string; type?: string; key?: string; nullable?: boolean; notNull?: boolean; default?: string };
+    const key = col.key === 'primary' ? 'PK ' : col.key === 'foreign' ? 'FK ' : col.key === 'primary_foreign' ? 'PK,FK ' : col.key === 'unique' ? 'UK ' : '';
+    const notNullSuffix = col.nullable === false || col.notNull === true ? ' NOT NULL' : '';
+    const defaultSuffix = col.default ? ` DEFAULT ${col.default}` : '';
+    const name = col.name ?? `column_${columnIndex + 1}`;
+    const type = col.type ? ` : ${col.type}` : '';
+    const initialText = `${key}${name}${type}${notNullSuffix}${defaultSuffix}`;
+    const localRow = { x: padX, y: (columnIndex + 1) * layout.rowHeight, w: contentW, h: layout.rowHeight };
+
+    const rad = (diagram.rotation ?? 0) * (Math.PI / 180);
+    const centerPointX = diagram.x + diagram.w / 2, centerPointY = diagram.y + diagram.h / 2;
+    const rowWorldCenter = {
+      x: diagram.x + localRow.x + localRow.w / 2,
+      y: diagram.y + localRow.y + localRow.h / 2,
+    };
+    const rowWorldRotated = rad !== 0 ? {
+      x: centerPointX + (rowWorldCenter.x - centerPointX) * Math.cos(rad) - (rowWorldCenter.y - centerPointY) * Math.sin(rad),
+      y: centerPointY + (rowWorldCenter.x - centerPointX) * Math.sin(rad) + (rowWorldCenter.y - centerPointY) * Math.cos(rad),
+    } : rowWorldCenter;
+    const sp = this.worldToClient(rowWorldRotated.x - localRow.w / 2, rowWorldRotated.y - localRow.h / 2);
+
+    return {
+      localBounds: localRow,
+      clientBounds: {
+        l: sp.x,
+        t: sp.y,
+        w: localRow.w * this.cam.zoom,
+        h: localRow.h * this.cam.zoom,
+      },
+      fontSize: fs,
+      textAlign: 'left',
+      initialText,
+    };
+  }
+
+  public addErTableColumn(shapeId: string, insertIndex?: number, text = 'new_column : varchar(255)'): number | null {
+    const shape = this.shapes.get(shapeId);
+    if (!shape || shape.type !== 'diagram') return null;
+    const diagram = shape as DiagramShape;
+    const def = getShapeDefinition(diagram.shapeId);
+    if (!def || (def.id !== 'erd.er-table' && def.id !== 'erd.table' && def.id !== 'erd.view')) return null;
+
+    const rawTable = (diagram.data?.table ?? def.defaultData?.table) as { columns?: TableColumnModel[] } | undefined;
+    const columns: TableColumnModel[] = [...(rawTable?.columns ?? [])];
+    const targetIdx = insertIndex !== undefined && insertIndex >= 0 && insertIndex <= columns.length ? insertIndex : columns.length;
+
+    let remaining = text.trim();
+    let key: TableColumnModel['key'] = 'none';
+    let nullable = true;
+    let defVal: string | undefined = undefined;
+
+    if (/^(?:pk,?\s*fk|pfk)\s+/i.test(remaining)) {
+      key = 'primary_foreign'; remaining = remaining.replace(/^(?:pk,?\s*fk|pfk)\s+/i, '').trim();
+    } else if (/^pk\s+/i.test(remaining)) {
+      key = 'primary'; remaining = remaining.replace(/^pk\s+/i, '').trim();
+    } else if (/^fk\s+/i.test(remaining)) {
+      key = 'foreign'; remaining = remaining.replace(/^fk\s+/i, '').trim();
+    } else if (/^(?:uk|unique)\s+/i.test(remaining)) {
+      key = 'unique'; remaining = remaining.replace(/^(?:uk|unique)\s+/i, '').trim();
+    }
+
+    const defaultMatch = remaining.match(/\s+default\s+([^\s]+)$/i);
+    if (defaultMatch) {
+      defVal = defaultMatch[1];
+      remaining = remaining.slice(0, defaultMatch.index).trim();
+    }
+
+    if (/\s+not\s+null$/i.test(remaining)) {
+      nullable = false; remaining = remaining.replace(/\s+not\s+null$/i, '').trim();
+    } else if (/\s+null$/i.test(remaining)) {
+      nullable = true; remaining = remaining.replace(/\s+null$/i, '').trim();
+    } else if (/\s*\*\s*$/.test(remaining)) {
+      nullable = false; remaining = remaining.replace(/\s*\*\s*$/, '').trim();
+    }
+
+    const colonIdx = remaining.indexOf(':');
+    const name = colonIdx >= 0 ? remaining.slice(0, colonIdx).trim() : remaining;
+    const type = colonIdx >= 0 ? remaining.slice(colonIdx + 1).trim() : 'varchar(255)';
+
+    const newCol: TableColumnModel = {
+      id: `col-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+      name: name || `column_${columns.length + 1}`,
+      type: type || 'varchar(255)',
+      key,
+      nullable: key === 'primary' || key === 'primary_foreign' ? false : nullable,
+      ...(defVal !== undefined ? { default: defVal } : {}),
+    };
+
+    columns.splice(targetIdx, 0, newCol);
+    const neededHeight = Math.max(diagram.h, (columns.length + 1) * 32);
+
+    this.put({
+      ...diagram,
+      h: neededHeight,
+      data: {
+        ...(diagram.data ?? {}),
+        table: { ...(rawTable ?? {}), columns },
+      },
+    });
+    this.dirty = true;
+    this.saveH();
+    return targetIdx;
+  }
+
+  public removeErTableColumn(shapeId: string, columnIndex: number): boolean {
+    const shape = this.shapes.get(shapeId);
+    if (!shape || shape.type !== 'diagram') return false;
+    const diagram = shape as DiagramShape;
+    const def = getShapeDefinition(diagram.shapeId);
+    if (!def || (def.id !== 'erd.er-table' && def.id !== 'erd.table' && def.id !== 'erd.view')) return false;
+
+    const rawTable = (diagram.data?.table ?? def.defaultData?.table) as { columns?: TableColumnModel[] } | undefined;
+    const columns: TableColumnModel[] = [...(rawTable?.columns ?? [])];
+    if (columnIndex < 0 || columnIndex >= columns.length) return false;
+
+    columns.splice(columnIndex, 1);
+    this.put({
+      ...diagram,
+      data: {
+        ...(diagram.data ?? {}),
+        table: { ...(rawTable ?? {}), columns },
+      },
+    });
+    this.dirty = true;
+    this.saveH();
+    return true;
+  }
+
   public updateErTableColumn(shapeId: string, columnIndex: number, text: string): boolean {
     const shape = this.shapes.get(shapeId);
     if (!shape || shape.type !== 'diagram') return false;
     const diagram = shape as DiagramShape;
     const def = getShapeDefinition(diagram.shapeId);
-    if (!def || (def.id !== 'erd.er-table' && def.id !== 'erd.table')) return false;
+    if (!def || (def.id !== 'erd.er-table' && def.id !== 'erd.table' && def.id !== 'erd.view')) return false;
 
-    const rawTable = (diagram.data?.table ?? def.defaultData?.table) as { columns?: Array<Record<string, unknown>> } | undefined;
-    const columns = [...(rawTable?.columns ?? [])];
+    const rawTable = (diagram.data?.table ?? def.defaultData?.table) as { columns?: TableColumnModel[] } | undefined;
+    const columns: TableColumnModel[] = [...(rawTable?.columns ?? [])];
     if (columnIndex < 0 || columnIndex >= columns.length) return false;
 
-    const oldCol = columns[columnIndex] ?? {};
-    const trimmed = text.trim();
-    let isPk = oldCol.key === 'primary';
-    let isFk = oldCol.key === 'foreign';
-    let remaining = trimmed;
-    if (/^pk\s+/i.test(remaining)) {
-      isPk = true; isFk = false; remaining = remaining.replace(/^pk\s+/i, '').trim();
+    const oldCol = columns[columnIndex] ?? { id: `col-${Date.now()}`, name: 'column', type: 'varchar(255)' };
+    let remaining = text.trim();
+    let key: TableColumnModel['key'] = oldCol.key ?? 'none';
+    let nullable = oldCol.nullable ?? true;
+    let defVal = oldCol.default;
+
+    if (/^(?:pk,?\s*fk|pfk)\s+/i.test(remaining)) {
+      key = 'primary_foreign'; remaining = remaining.replace(/^(?:pk,?\s*fk|pfk)\s+/i, '').trim();
+    } else if (/^pk\s+/i.test(remaining)) {
+      key = 'primary'; remaining = remaining.replace(/^pk\s+/i, '').trim();
     } else if (/^fk\s+/i.test(remaining)) {
-      isFk = true; isPk = false; remaining = remaining.replace(/^fk\s+/i, '').trim();
+      key = 'foreign'; remaining = remaining.replace(/^fk\s+/i, '').trim();
+    } else if (/^(?:uk|unique)\s+/i.test(remaining)) {
+      key = 'unique'; remaining = remaining.replace(/^(?:uk|unique)\s+/i, '').trim();
     }
+
+    const defaultMatch = remaining.match(/\s+default\s+([^\s]+)$/i);
+    if (defaultMatch) {
+      defVal = defaultMatch[1];
+      remaining = remaining.slice(0, defaultMatch.index).trim();
+    }
+
+    if (/\s+not\s+null$/i.test(remaining)) {
+      nullable = false; remaining = remaining.replace(/\s+not\s+null$/i, '').trim();
+    } else if (/\s+null$/i.test(remaining)) {
+      nullable = true; remaining = remaining.replace(/\s+null$/i, '').trim();
+    } else if (/\s*\*\s*$/.test(remaining)) {
+      nullable = false; remaining = remaining.replace(/\s*\*\s*$/, '').trim();
+    }
+
     const colonIdx = remaining.indexOf(':');
     const name = colonIdx >= 0 ? remaining.slice(0, colonIdx).trim() : remaining;
-    const type = colonIdx >= 0 ? remaining.slice(colonIdx + 1).trim() : (oldCol.type as string | undefined ?? 'text');
+    const type = colonIdx >= 0 ? remaining.slice(colonIdx + 1).trim() : (oldCol.type ?? 'varchar(255)');
     columns[columnIndex] = {
       ...oldCol,
-      name: name || (oldCol.name as string | undefined ?? 'column'),
-      type: type || 'text',
-      key: isPk ? 'primary' : isFk ? 'foreign' : 'none',
+      name: name || oldCol.name || 'column',
+      type: type || 'varchar(255)',
+      key,
+      nullable: key === 'primary' || key === 'primary_foreign' ? false : nullable,
+      ...(defVal !== undefined ? { default: defVal } : {}),
     };
 
     this.put({
@@ -5938,12 +6116,16 @@ export class CanvasEngine {
   private cachedDiagramGeometry(shape: DiagramShape): CachedDiagramGeometry {
     const params = shape.params ?? {};
     const definition = getShapeDefinition(shape.shapeId)!;
+    const tableColumns = (shape.data?.table as { columns?: unknown[] } | undefined)?.columns;
+    const effectiveParams = definition.geometry === 'table' && Array.isArray(tableColumns) && tableColumns.length > 0
+      ? { ...params, rowCount: tableColumns.length + 1 }
+      : params;
     const scale = definition.solid3d
       ? shape.scale3d ?? definition.defaultScale3d ?? solid3DScaleFromBounds(shape.w, shape.h, definition.width, definition.height, definition.geometry as Solid3DGeometry) : undefined;
-    const key = `${shape.shapeId}|${shape.w}|${shape.h}|${JSON.stringify(params)}|${JSON.stringify(scale ?? null)}`;
+    const key = `${shape.shapeId}|${shape.w}|${shape.h}|${JSON.stringify(effectiveParams)}|${JSON.stringify(scale ?? null)}`;
     const cached = this.geometryCache.get(shape as object);
     if (cached?.key === key) return cached;
-    const geometry = buildShapeGeometry(definition, shape.w, shape.h, params, definition.solid3d ? {
+    const geometry = buildShapeGeometry(definition, shape.w, shape.h, effectiveParams, definition.solid3d ? {
       scale, referenceWidth: definition.width, referenceHeight: definition.height, center: { x: 0, y: 0 },
     } : undefined);
     const { outline, decorations, decorationStyles, intrinsicFills, intrinsicFillColors, hiddenEdges, visibleFaces = [], projection } = geometry;
@@ -6154,9 +6336,9 @@ export class CanvasEngine {
     cx.font = `${params.italicName === true ? 'italic ' : ''}${fs}px Inter, 'Segoe UI', sans-serif`;
 
     const isStructuredShape = definition.geometry === 'table' && (
-      (Boolean(shape.data?.table) && Array.isArray((shape.data?.table as Record<string, unknown>)?.columns)) ||
-      (Boolean(shape.data?.classifier) && Array.isArray((shape.data?.classifier as Record<string, unknown>)?.compartments)) ||
-      (Boolean(shape.data?.instance) && Array.isArray((shape.data?.instance as Record<string, unknown>)?.values))
+      (Boolean(shape.data?.table) && Array.isArray(shape.data?.table?.columns)) ||
+      (Boolean(shape.data?.classifier) && Array.isArray((shape.data?.classifier as unknown as Record<string, unknown>)?.compartments)) ||
+      (Boolean(shape.data?.instance) && Array.isArray((shape.data?.instance as unknown as Record<string, unknown>)?.values))
     );
     if (shape.id === this.editingId && !isStructuredShape && shape.shapeId !== 'uml.use-case-ext') {
       cx.restore(); return;
@@ -6354,6 +6536,23 @@ export class CanvasEngine {
       cx.fillText(text, w / 2, h * 0.75, Math.max(1, w * 0.72));
       cx.restore(); return;
     }
+    if (definition.geometry === 'diamond') {
+      const isIdentifying = params.doubleBorder === true;
+      const safeFraction = isIdentifying ? 0.54 : 0.64;
+      const maxTextW = Math.max(minFont(8), w * safeFraction);
+      const diamondFs = Math.max(minFont(4), Math.min(fs, h * 0.22, w * 0.15));
+      cx.font = `${params.italicName === true ? 'italic ' : ''}600 ${diamondFs}px Inter, 'Segoe UI', sans-serif`;
+      cx.fillStyle = shape.textColor ?? '#0f172a';
+      cx.textAlign = 'center';
+      cx.textBaseline = 'middle';
+      const lines = this.wrapCanvasText(text, maxTextW);
+      const lineHeight = diamondFs * 1.25;
+      const firstY = h / 2 - (lines.length - 1) * lineHeight / 2;
+      lines.forEach((line, index) => {
+        if (line) cx.fillText(line, w / 2, firstY + index * lineHeight, maxTextW);
+      });
+      cx.restore(); return;
+    }
     if (definition.geometry === 'associativeEntity') {
       cx.font = `${Math.max(minFont(3), Math.min(fs, Math.min(w, h) * 0.16))}px Inter, 'Segoe UI', sans-serif`;
       cx.fillText(text, w / 2, h / 2, Math.max(1, Math.min(w, h) * 0.66));
@@ -6546,26 +6745,179 @@ export class CanvasEngine {
     const columns = rawColumns.filter(isRecord).slice(0, 32);
     const layout = structuredTableLayout(h, columns.length + 1);
     const title = typeof shape.text === 'string' && shape.text.trim() ? shape.text.trim() : definition.label;
-    const left = Math.max(minFont(2), Math.min(8 * fontScale, w * 0.05)), maxWidth = Math.max(1, w - left * 2);
+    const padX = Math.max(minFont(3), Math.min(10 * fontScale, w * 0.05));
+    const maxWidth = Math.max(1, w - padX * 2);
 
     const isEditingThis = shape.id === this.editingId;
     const editingTarget = isEditingThis ? this.editingClassifierContext?.target : undefined;
     const editingColIdx = isEditingThis ? this.editingClassifierContext?.columnIndex : undefined;
 
-    cx.textAlign = 'left'; cx.textBaseline = 'middle'; cx.fillStyle = shape.textColor ?? '#1f2937';
-    if (layout.rowHeight >= minFont(4) && editingTarget !== 'header') {
-      cx.font = `600 ${Math.max(minFont(3.5), Math.min(fs, layout.rowHeight * 0.68))}px Inter, 'Segoe UI', sans-serif`;
-      cx.fillText(title, left, layout.rowCenters[0], maxWidth);
+    // 1. Shaded header background bar (StarUML / DBeaver / draw.io style)
+    cx.save();
+    cx.fillStyle = 'rgba(241, 245, 249, 0.85)';
+    if (typeof cx.roundRect === 'function') {
+      cx.beginPath();
+      cx.roundRect(0, 0, w, layout.rowHeight, [4, 4, 0, 0]);
+      cx.fill();
+    } else {
+      cx.fillRect(0, 0, w, layout.rowHeight);
     }
+    // Header bottom border
+    cx.beginPath();
+    cx.moveTo(0, layout.rowHeight);
+    cx.lineTo(w, layout.rowHeight);
+    cx.strokeStyle = shape.stroke || '#2563eb';
+    cx.lineWidth = Math.max(1.2, (shape.sw || 1.5) * 0.9);
+    cx.stroke();
+    cx.restore();
+
+    // 2. Header text
+    if (layout.rowHeight >= minFont(4) && editingTarget !== 'header') {
+      cx.save();
+      cx.fillStyle = shape.textColor ?? '#0f172a';
+      cx.textAlign = 'center';
+      cx.textBaseline = 'middle';
+      const headerFs = Math.max(minFont(4), Math.min(fs * 1.05, layout.rowHeight * 0.58));
+      cx.font = `700 ${headerFs}px Inter, 'Segoe UI', sans-serif`;
+
+      const isView = definition.id === 'erd.view' || shape.params?.stereotype === 'view';
+      if (isView) {
+        const stereotypeFs = Math.max(minFont(3), headerFs * 0.72);
+        cx.font = `500 ${stereotypeFs}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = '#64748b';
+        cx.fillText('«view»', w / 2, layout.rowCenters[0] - headerFs * 0.38, maxWidth);
+        cx.font = `700 ${headerFs * 0.88}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = shape.textColor ?? '#0f172a';
+        cx.fillText(title, w / 2, layout.rowCenters[0] + stereotypeFs * 0.38, maxWidth);
+      } else {
+        cx.fillText(title, w / 2, layout.rowCenters[0], maxWidth);
+      }
+      cx.restore();
+    }
+
+    // 3. Find last Primary Key index to draw the standard IDEF1X / StarUML compartment divider
+    const lastPkIndex = columns.findLastIndex(col => col.key === 'primary' || col.key === 'primary_foreign');
+
+    // 4. Render rows with badges, column names, nullability, and types
     columns.forEach((column, index) => {
-      if (editingTarget === 'member' && index === editingColIdx) return;
       const rowHeight = layout.rowHeight;
       if (rowHeight < minFont(4)) return;
-      const key = column.key === 'primary' ? 'PK  ' : column.key === 'foreign' ? 'FK  ' : '';
-      const name = typeof column.name === 'string' && column.name.trim() ? column.name.trim() : `column ${index + 1}`;
-      const type = typeof column.type === 'string' && column.type.trim() ? ` : ${column.type.trim()}` : '';
-      cx.font = `${Math.max(minFont(3.5), Math.min(fs, rowHeight * 0.66))}px Inter, 'Segoe UI', sans-serif`;
-      cx.fillText(`${key}${name}${type}`, left, layout.rowCenters[index + 1], maxWidth);
+      const rowTop = layout.dividerYs[index];
+      const rowCenter = layout.rowCenters[index + 1];
+
+      // Subtle zebra striping for alternating rows
+      if (index % 2 === 1) {
+        cx.save();
+        cx.fillStyle = 'rgba(248, 250, 252, 0.45)';
+        cx.fillRect(0, rowTop, w, rowHeight);
+        cx.restore();
+      }
+
+      // If this column is currently being inline-edited, skip rendering text
+      if (editingTarget === 'member' && index === editingColIdx) return;
+
+      const key = typeof column.key === 'string' ? column.key : 'none';
+      const isPfk = key === 'primary_foreign';
+      const isPk = key === 'primary';
+      const isFk = key === 'foreign';
+      const isUk = key === 'unique';
+      const isNotNull = column.nullable === false || column.notNull === true;
+
+      const colFs = Math.max(minFont(3.5), Math.min(fs, rowHeight * 0.62));
+      const badgeH = Math.max(10, Math.min(rowHeight * 0.72, colFs * 1.35));
+      const badgeFs = Math.max(minFont(2.8), colFs * 0.74);
+
+      let currentX = padX;
+
+      // Key Badge pill (e.g. PK in amber, FK in blue, PK,FK in purple, UK in violet)
+      if (isPfk || isPk || isFk || isUk) {
+        const badgeLabel = isPfk ? 'PK,FK' : isPk ? 'PK' : isFk ? 'FK' : 'UK';
+        const badgeBg = isPfk ? '#ede9fe' : isPk ? '#fef3c7' : isFk ? '#dbeafe' : '#f3e8ff';
+        const badgeColor = isPfk ? '#6d28d9' : isPk ? '#b45309' : isFk ? '#1d4ed8' : '#7c3aed';
+        const badgeBorder = isPfk ? '#ddd6fe' : isPk ? '#fcd34d' : isFk ? '#bfdbfe' : '#e9d5ff';
+
+        cx.save();
+        cx.font = `700 ${badgeFs}px 'SF Mono', Consolas, Inter, sans-serif`;
+        const textW = cx.measureText(badgeLabel).width;
+        const badgeW = textW + 6;
+        const badgeY = rowCenter - badgeH / 2;
+
+        cx.fillStyle = badgeBg;
+        cx.strokeStyle = badgeBorder;
+        cx.lineWidth = 0.8;
+        if (typeof cx.roundRect === 'function') {
+          cx.beginPath();
+          cx.roundRect(currentX, badgeY, badgeW, badgeH, 3);
+          cx.fill();
+          cx.stroke();
+        } else {
+          cx.fillRect(currentX, badgeY, badgeW, badgeH);
+          cx.strokeRect(currentX, badgeY, badgeW, badgeH);
+        }
+
+        cx.fillStyle = badgeColor;
+        cx.textAlign = 'center';
+        cx.textBaseline = 'middle';
+        cx.fillText(badgeLabel, currentX + badgeW / 2, rowCenter);
+        cx.restore();
+
+        currentX += badgeW + 6;
+      }
+
+      // Column Name
+      const name = typeof column.name === 'string' && column.name.trim() ? column.name.trim() : `column_${index + 1}`;
+      const nameFs = colFs;
+      cx.save();
+      cx.font = `${(isPk || isPfk) ? '650' : '500'} ${nameFs}px Inter, 'Segoe UI', sans-serif`;
+      cx.fillStyle = (isPk || isPfk) ? (shape.textColor ?? '#0f172a') : (shape.textColor ?? '#334155');
+      cx.textAlign = 'left';
+      cx.textBaseline = 'middle';
+
+      // Reserve right space for data type
+      const typeStr = typeof column.type === 'string' && column.type.trim() ? column.type.trim() : '';
+      const typeFs = Math.max(minFont(3), colFs * 0.86);
+      cx.font = `400 ${typeFs}px 'SF Mono', Consolas, monospace, sans-serif`;
+      const typeW = typeStr ? cx.measureText(typeStr).width + 8 : 0;
+      const notNullIndicatorW = isNotNull ? 12 : 0;
+
+      const availNameW = Math.max(10, w - currentX - typeW - notNullIndicatorW - padX);
+      cx.font = `${(isPk || isPfk) ? '650' : '500'} ${nameFs}px Inter, 'Segoe UI', sans-serif`;
+      cx.fillText(name, currentX, rowCenter, availNameW);
+
+      const nameMeasuredW = Math.min(availNameW, cx.measureText(name).width);
+      const afterNameX = currentX + nameMeasuredW + 3;
+
+      // Nullability indicator (mandatory asterisk *)
+      if (isNotNull) {
+        cx.font = `700 ${Math.max(minFont(3.2), colFs * 0.88)}px Inter, 'Segoe UI', sans-serif`;
+        cx.fillStyle = '#ef4444';
+        cx.fillText('*', afterNameX, rowCenter - 1);
+      }
+      cx.restore();
+
+      // Column Data Type (right-aligned)
+      if (typeStr) {
+        cx.save();
+        cx.font = `400 ${typeFs}px 'SF Mono', Consolas, monospace, sans-serif`;
+        cx.fillStyle = '#64748b';
+        cx.textAlign = 'right';
+        cx.textBaseline = 'middle';
+        cx.fillText(typeStr, w - padX, rowCenter, Math.max(10, w * 0.45));
+        cx.restore();
+      }
+
+      // 5. Divider after last Primary Key (IDEF1X standard compartment divider)
+      if (lastPkIndex >= 0 && lastPkIndex < columns.length - 1 && index === lastPkIndex) {
+        const pkDividerY = layout.dividerYs[index + 1];
+        cx.save();
+        cx.beginPath();
+        cx.moveTo(0, pkDividerY);
+        cx.lineTo(w, pkDividerY);
+        cx.strokeStyle = shape.stroke || '#2563eb';
+        cx.lineWidth = Math.max(1.2, (shape.sw || 1.5) * 0.8);
+        cx.stroke();
+        cx.restore();
+      }
     });
   }
 
@@ -6817,10 +7169,45 @@ export class CanvasEngine {
     cx.save(); cx.strokeStyle = connector.color; cx.fillStyle = connector.color; cx.lineWidth = Math.max(0.5, connector.sw);
     cx.lineCap = 'round'; cx.lineJoin = 'round';
     cx.setLineDash(connector.lineStyle === 'dashed' ? [8, 5] : connector.lineStyle === 'dotted' ? [2, 4] : []);
-    cx.beginPath();
-    cx.moveTo(points[0][0], points[0][1]);
-    for (let index = 1; index < points.length; index++) cx.lineTo(points[index][0], points[index][1]);
-    cx.stroke(); cx.setLineDash([]);
+    const isTotalParticipation = connector.erdParticipation === 'total';
+    if (isTotalParticipation && points.length >= 2) {
+      const gap = 1.75;
+      for (const sign of [-1, 1]) {
+        cx.beginPath();
+        for (let i = 0; i < points.length; i++) {
+          let nx = 0, ny = 0;
+          if (i === 0) {
+            const dx = points[1][0] - points[0][0], dy = points[1][1] - points[0][1];
+            const len = Math.hypot(dx, dy) || 1;
+            nx = -dy / len; ny = dx / len;
+          } else if (i === points.length - 1) {
+            const dx = points[i][0] - points[i - 1][0], dy = points[i][1] - points[i - 1][1];
+            const len = Math.hypot(dx, dy) || 1;
+            nx = -dy / len; ny = dx / len;
+          } else {
+            const dx1 = points[i][0] - points[i - 1][0], dy1 = points[i][1] - points[i - 1][1];
+            const len1 = Math.hypot(dx1, dy1) || 1;
+            const dx2 = points[i + 1][0] - points[i][0], dy2 = points[i + 1][1] - points[i][1];
+            const len2 = Math.hypot(dx2, dy2) || 1;
+            nx = (-dy1 / len1 + -dy2 / len2) / 2;
+            ny = (dx1 / len1 + dx2 / len2) / 2;
+            const norm = Math.hypot(nx, ny) || 1;
+            nx /= norm; ny /= norm;
+          }
+          const px = points[i][0] + nx * gap * sign;
+          const py = points[i][1] + ny * gap * sign;
+          if (i === 0) cx.moveTo(px, py);
+          else cx.lineTo(px, py);
+        }
+        cx.stroke();
+      }
+    } else {
+      cx.beginPath();
+      cx.moveTo(points[0][0], points[0][1]);
+      for (let index = 1; index < points.length; index++) cx.lineTo(points[index][0], points[index][1]);
+      cx.stroke();
+    }
+    cx.setLineDash([]);
     const labelVisuals = this.connectorLabelVisuals(connector, points);
     for (const label of labelVisuals) {
       cx.save();
@@ -7108,6 +7495,7 @@ export class CanvasEngine {
   }
 
   private drawSelection(shape: AnyShape) {
+    if (this.editingId && shape.id === this.editingId) return;
     if (['sticky', 'text', 'math', 'code', 'image'].includes(shape.type)) return; // DOM overlays own their focus/selection chrome.
     const { cx, cam } = this, zoom = Math.max(0.04, cam.zoom), handleRadius = 5 / zoom;
     cx.save(); cx.strokeStyle = '#3b82f6'; cx.fillStyle = '#ffffff'; cx.lineWidth = 2 / zoom;
@@ -7147,12 +7535,7 @@ export class CanvasEngine {
       const capabilities = diagramCapabilitiesFor(diagramDefinition);
       const solidShape = box.type === 'diagram' && diagramDefinition?.solid3d ? box as DiagramShape : null;
       if (solidShape) {
-        // 3D solids use their model-space XYZ gizmo only: no projected AABB frame or
-        // generic 2D resize/rotate handles are painted at any zoom or selection count.
-        if (this.sel.size === 1) {
-          const basis = this.solidTransformBasis(solidShape);
-          if (basis) this.drawSolidTransformControls(solidShape, basis);
-        }
+        this.drawSolidSelection(solidShape);
         cx.restore(); return;
       }
       const corners = rotatedBoxCorners(box);
@@ -7173,6 +7556,115 @@ export class CanvasEngine {
     const width = Math.max(0, shape.maxX - shape.minX), height = Math.max(0, shape.maxY - shape.minY);
     cx.setLineDash([]); cx.strokeRect(shape.minX, shape.minY, width, height);
     cx.restore();
+  }
+
+  private drawSolidSelection(shape: DiagramShape) {
+    const { cx, cam } = this, zoom = Math.max(0.04, cam.zoom);
+    const cached = this.cachedDiagramGeometry(shape);
+    const projectionObj = cached.projection as { projectedBounds?: { minX: number; minY: number; maxX: number; maxY: number } } | undefined;
+    const bounds = projectionObj?.projectedBounds ?? {
+      minX: -shape.w / 2, minY: -shape.h / 2, maxX: shape.w / 2, maxY: shape.h / 2,
+    };
+
+    cx.save();
+    cx.translate(shape.x, shape.y);
+    if ((shape.rotation ?? 0) !== 0) {
+      cx.rotate((shape.rotation ?? 0) * Math.PI / 180);
+    }
+
+    // 1. Blender / Unity 3D glowing silhouette outline
+    cx.save();
+    cx.strokeStyle = '#2563eb';
+    cx.lineWidth = 2.8 / zoom;
+    cx.lineCap = 'round';
+    cx.lineJoin = 'round';
+    cx.shadowColor = '#3b82f6';
+    cx.shadowBlur = 10 / zoom;
+    if (cached.path) cx.stroke(cached.path);
+    else { drawPathCommands(cx, cached.outline); cx.stroke(); }
+    cx.restore();
+
+    // 2. Wireframe facet illumination (Blender / Unity edge highlights)
+    if (cached.decorations?.length) {
+      cx.save();
+      cx.strokeStyle = 'rgba(96, 165, 250, 0.9)';
+      cx.lineWidth = 1.3 / zoom;
+      cx.lineCap = 'round';
+      cx.lineJoin = 'round';
+      for (const commands of cached.decorations) {
+        cx.beginPath();
+        drawPathCommands(cx, commands);
+        cx.stroke();
+      }
+      cx.restore();
+    }
+
+    // 3. 3D Bounding Cage / Corner Brackets (Blender / Unity 3D style)
+    const pad = 6 / zoom;
+    const bMinX = bounds.minX - pad, bMinY = bounds.minY - pad;
+    const bMaxX = bounds.maxX + pad, bMaxY = bounds.maxY + pad;
+    const bW = bMaxX - bMinX, bH = bMaxY - bMinY;
+
+    // Subtle dashed bounding box
+    cx.save();
+    cx.strokeStyle = 'rgba(59, 130, 246, 0.45)';
+    cx.lineWidth = 1 / zoom;
+    cx.setLineDash([4 / zoom, 4 / zoom]);
+    cx.strokeRect(bMinX, bMinY, bW, bH);
+    cx.restore();
+
+    // High-tech Corner Brackets
+    const bracketLen = Math.min(14 / zoom, Math.min(bW, bH) * 0.28);
+    cx.save();
+    cx.strokeStyle = '#2563eb';
+    cx.lineWidth = 2.2 / zoom;
+    cx.lineCap = 'round';
+    cx.lineJoin = 'round';
+
+    // Top-Left corner
+    cx.beginPath();
+    cx.moveTo(bMinX, bMinY + bracketLen);
+    cx.lineTo(bMinX, bMinY);
+    cx.lineTo(bMinX + bracketLen, bMinY);
+    cx.stroke();
+
+    // Top-Right corner
+    cx.beginPath();
+    cx.moveTo(bMaxX - bracketLen, bMinY);
+    cx.lineTo(bMaxX, bMinY);
+    cx.lineTo(bMaxX, bMinY + bracketLen);
+    cx.stroke();
+
+    // Bottom-Right corner
+    cx.beginPath();
+    cx.moveTo(bMaxX, bMaxY - bracketLen);
+    cx.lineTo(bMaxX, bMaxY);
+    cx.lineTo(bMaxX - bracketLen, bMaxY);
+    cx.stroke();
+
+    // Bottom-Left corner
+    cx.beginPath();
+    cx.moveTo(bMinX + bracketLen, bMaxY);
+    cx.lineTo(bMinX, bMaxY);
+    cx.lineTo(bMinX, bMaxY - bracketLen);
+    cx.stroke();
+
+    // 4. Center Anchor / Pivot Indicator (Blender / Unity origin point)
+    cx.beginPath();
+    cx.arc(0, 0, 4 / zoom, 0, Math.PI * 2);
+    cx.fillStyle = '#3b82f6';
+    cx.fill();
+    cx.strokeStyle = '#ffffff';
+    cx.lineWidth = 1.5 / zoom;
+    cx.stroke();
+
+    cx.restore();
+
+    // 5. If single selection, also draw interactive 3D rotation & scale controls
+    if (this.sel.size === 1) {
+      const basis = this.solidTransformBasis(shape);
+      if (basis) this.drawSolidTransformControls(shape, basis);
+    }
   }
 
   private saveH() {
@@ -7450,7 +7942,12 @@ function drawCardinalityMarker(ctx: CanvasRenderingContext2D, cardinality: strin
   const ux = Math.cos(angle), uy = Math.sin(angle), nx = -uy, ny = ux;
   ctx.save(); ctx.strokeStyle = color; ctx.fillStyle = '#ffffff'; ctx.lineWidth = 1.5;
   if (cardinality === 'many' || cardinality === 'one-or-many' || cardinality === 'zero-or-many') drawCrowFoot(ctx, x, y, angle, size);
-  if (cardinality === 'one' || cardinality === 'one-or-many') drawEndpointMarkerAt(ctx, 'bar', x - ux * (cardinality === 'one-or-many' ? size * 0.7 : 0), y - uy * (cardinality === 'one-or-many' ? size * 0.7 : 0), angle, size * 0.75);
+  if (cardinality === 'one') {
+    drawEndpointMarkerAt(ctx, 'bar', x, y, angle, size * 0.75);
+    drawEndpointMarkerAt(ctx, 'bar', x - ux * size * 0.45, y - uy * size * 0.45, angle, size * 0.75);
+  } else if (cardinality === 'one-or-many') {
+    drawEndpointMarkerAt(ctx, 'bar', x - ux * size * 0.7, y - uy * size * 0.7, angle, size * 0.75);
+  }
   if (cardinality === 'zero-or-one' || cardinality === 'zero-or-many') {
     const offset = cardinality === 'zero-or-one' ? size * 0.45 : size * 0.85;
     ctx.beginPath(); ctx.arc(x - ux * offset, y - uy * offset, size * 0.22, 0, Math.PI * 2); ctx.fill(); ctx.stroke();

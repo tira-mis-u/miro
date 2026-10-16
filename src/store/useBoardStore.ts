@@ -2,8 +2,18 @@ import * as Y from 'yjs';
 import { HocuspocusProvider, WebSocketStatus } from '@hocuspocus/provider';
 import type { AnyShape } from '../engine/CanvasEngine';
 import { IndexedDbYjsUpdateStorage, LocalYjsPersistence, type LocalPersistenceStatus, type YjsUpdateStorage } from './localYjsPersistence';
+import { initCollabPresence } from './collabPresence';
 
-export const BOARD_ID = 'board-1';
+export function getBoardId(): string {
+  if (typeof window !== 'undefined') {
+    const params = new URLSearchParams(window.location.search);
+    const custom = params.get('board')?.trim();
+    if (custom) return custom;
+  }
+  return 'board-1';
+}
+
+export const BOARD_ID = getBoardId();
 export const ydoc = new Y.Doc();
 export const yShapes = ydoc.getMap<AnyShape>('shapes');
 
@@ -55,25 +65,71 @@ function receiveLocalStatus(status: LocalPersistenceStatus): void {
   publishStatus({ local: localState, message: localMessage });
 }
 
+/**
+ * Dynamically resolves WebSocket URL based on current page URL, supporting:
+ * - Current domain & port changes (never hardcoded to localhost)
+ * - Auto-negotiation of HTTPS -> wss: and HTTP -> ws:
+ * - Query parameter override (?ws_url=...) or environment variable (VITE_WS_URL)
+ * - Reverse proxy subpaths (e.g., /miro/ws, /boards/ws)
+ */
+export function resolveRealtimeWsUrl(path = '/ws'): string {
+  if (typeof window === 'undefined') return '';
+  try {
+    const params = new URLSearchParams(window.location.search);
+    const custom = params.get('ws_url');
+    if (custom && custom.trim()) return custom.trim();
+  } catch {
+    // Ignore URL parse errors
+  }
+
+  const envWs = (import.meta as unknown as { env?: { VITE_WS_URL?: string } }).env?.VITE_WS_URL;
+  if (typeof envWs === 'string' && envWs.trim()) {
+    return envWs.trim();
+  }
+
+  const isSecure = window.location.protocol === 'https:';
+  const wsProtocol = isSecure ? 'wss:' : 'ws:';
+  const url = new URL(path, window.location.href);
+  url.protocol = wsProtocol;
+  return url.toString();
+}
+
 function connectRealtime(): void {
   if (realtimeProvider || typeof window === 'undefined') return;
-  const url = new URL('/ws', window.location.href);
-  url.protocol = url.protocol === 'https:' ? 'wss:' : 'ws:';
+  const wsUrl = resolveRealtimeWsUrl('/ws');
   try {
+    const currentBoardId = getBoardId();
     realtimeProvider = new HocuspocusProvider({
-      url: url.toString(),
-      name: BOARD_ID,
+      url: wsUrl,
+      name: currentBoardId,
       document: ydoc,
-      onStatus: ({ status }) => publishStatus({
-        sync: status === WebSocketStatus.Connected ? 'connected' : status === WebSocketStatus.Connecting ? 'connecting' : 'disconnected',
-      }),
+      onStatus: ({ status }) => {
+        publishStatus({
+          sync: status === WebSocketStatus.Connected ? 'connected' : status === WebSocketStatus.Connecting ? 'connecting' : 'disconnected',
+        });
+        if (status === WebSocketStatus.Connected && realtimeProvider?.awareness) {
+          initCollabPresence(realtimeProvider.awareness);
+        }
+      },
       onSynced: ({ state }) => publishStatus({ sync: state ? 'synced' : 'connected' }),
       onUnsyncedChanges: ({ number }) => publishStatus({ unsyncedRemoteChanges: number > 0 }),
       onDisconnect: () => publishStatus({ sync: 'disconnected' }),
     });
+
+    if (realtimeProvider.awareness) {
+      initCollabPresence(realtimeProvider.awareness);
+    }
   } catch (error) {
     publishStatus({ sync: 'disconnected', message: error instanceof Error ? error.message : String(error) });
   }
+}
+
+export function getRealtimeProvider(): HocuspocusProvider | null {
+  return realtimeProvider;
+}
+
+export function getBoardAwareness(): import('y-protocols/awareness').Awareness | null {
+  return realtimeProvider?.awareness ?? null;
 }
 
 /** Restore local Yjs content before mounting the board engine or opening realtime sync. */

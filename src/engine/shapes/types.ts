@@ -437,6 +437,7 @@ export interface ShapeDefinition {
     endMarker?: EndpointMarker;
     sourceCardinality?: Cardinality;
     targetCardinality?: Cardinality;
+    erdParticipation?: 'partial' | 'total';
   }>;
   /** False only for retained compatibility definitions that must not appear in the picker. */
   readonly pickerVisible?: boolean;
@@ -461,8 +462,26 @@ export interface PathCommand {
   values: number[];
 }
 
+export interface TableColumnModel {
+  id: string;
+  name: string;
+  type: string;
+  key?: 'none' | 'primary' | 'foreign' | 'primary_foreign' | 'unique';
+  nullable?: boolean;
+  default?: string;
+  comment?: string;
+}
+
+export interface TableShapeData {
+  columns: TableColumnModel[];
+  schema?: string;
+  comment?: string;
+}
+
 export interface DiagramData {
   [key: string]: unknown;
+  table?: TableShapeData;
+  column?: TableColumnModel;
   sequenceParticipant?: SequenceParticipantData;
   sequenceActivation?: SequenceActivationData;
   sequenceLifecycle?: SequenceLifecycleData;
@@ -578,6 +597,8 @@ export interface ConnectorShapeObject {
   activityFlow?: UMLActivityFlowData;
   /** Use Case Extend dependency condition and referenced extension point. */
   usecaseExtend?: UMLExtendRelationshipData;
+  /** Chen ERD: 'total' renders parallel double lines (3.5px gap); 'partial' or undefined renders a single line. */
+  erdParticipation?: 'partial' | 'total';
   minX: number; minY: number; maxX: number; maxY: number;
 }
 

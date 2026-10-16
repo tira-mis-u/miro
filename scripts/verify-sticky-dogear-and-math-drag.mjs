@@ -4,8 +4,9 @@ async function run() {
   const browser = await chromium.launch({ channel: 'msedge', headless: true });
   const page = await browser.newPage({ viewport: { width: 1400, height: 900 } });
 
-  console.log('Navigating to http://localhost:5175/...');
-  await page.goto('http://localhost:5175/', { waitUntil: 'networkidle' });
+  const baseUrl = (process.env.APP_URL || process.env.BASE_URL || `http://127.0.0.1:${process.env.PORT || 5175}`).replace(/\/$/, '');
+  console.log(`Navigating to ${baseUrl}/...`);
+  await page.goto(`${baseUrl}/`, { waitUntil: 'networkidle' });
   await page.waitForTimeout(1000);
 
   // --- PART 1: TEST STICKY NOTE MECHANICS & AESTHETICS ---

@@ -88,7 +88,7 @@ export function hocuspocusPlugin(): Plugin {
         } catch (error) {
           console.error('[hocuspocus] shutdown failed:', error);
         } finally {
-          await pool.end();
+          await pool.end().catch(() => {});
         }
       };
 
