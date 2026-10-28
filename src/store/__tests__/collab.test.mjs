@@ -35,14 +35,14 @@ console.log(`✓ 500 concurrent users verified with 500 unique, non-colliding co
 
 // 3. Lowest available slot allocation & dynamic color collision avoidance
 const emptyTaken = new Set();
-const user1 = resolveAnonymousUser(emptyTaken);
+const user1 = resolveAnonymousUser(emptyTaken, undefined, undefined, undefined, undefined, false);
 assert.strictEqual(user1.anonymousNumber, 1);
 assert.strictEqual(user1.name, 'Anonymous 1');
 assert.strictEqual(user1.avatarLabel, 'A1');
 assert.strictEqual(user1.color, '#7c3aed');
 
 const taken1 = new Set([1]);
-const user2 = resolveAnonymousUser(taken1);
+const user2 = resolveAnonymousUser(taken1, undefined, undefined, undefined, undefined, false);
 assert.strictEqual(user2.anonymousNumber, 2);
 assert.strictEqual(user2.name, 'Anonymous 2');
 assert.strictEqual(user2.avatarLabel, 'A2');
@@ -50,14 +50,20 @@ assert.strictEqual(user2.color, '#059669');
 
 // Slot reuse when middle user disconnects: users 1 & 3 present -> next gets 2
 const takenGap = new Set([1, 3]);
-const userGap = resolveAnonymousUser(takenGap);
+const userGap = resolveAnonymousUser(takenGap, undefined, undefined, undefined, undefined, false);
 assert.strictEqual(userGap.anonymousNumber, 2, 'Must fill smallest available gap slot');
 
 // Collision avoidance: if Purple (#7c3aed) is taken by another user, slot 1 MUST choose a different color!
 const takenColors = new Set(['#7c3aed']);
-const userAvoid = resolveAnonymousUser(new Set(), takenColors);
+const userAvoid = resolveAnonymousUser(new Set(), takenColors, undefined, undefined, undefined, false);
 assert.strictEqual(userAvoid.anonymousNumber, 1);
 assert.notStrictEqual(userAvoid.color.toLowerCase(), '#7c3aed', 'Must never take a color that is already occupied by an active peer');
+
+// 3.1 Random RGB mode verification (dạng rgb(r, g, b))
+const randomUser = resolveAnonymousUser(emptyTaken, undefined, undefined, undefined, undefined, true);
+assert.ok(randomUser.color.startsWith('rgb('), `Expected random RGB format, got ${randomUser.color}`);
+assert.ok(randomUser.textColor === '#ffffff' || randomUser.textColor === '#0f172a');
+console.log(`✓ Random RGB generation verified: ${randomUser.color} with contrast text ${randomUser.textColor}`);
 console.log('✓ Lowest available anonymous slot & non-colliding color avoidance verified');
 
 // 3. Multi-client Awareness simulation

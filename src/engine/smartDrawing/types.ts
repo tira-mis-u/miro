@@ -1,6 +1,6 @@
 export type SmartDrawingPoint = [number, number, number?];
 export type Point2 = [number, number];
-export type SmartDrawingKind = 'line' | 'rectangle' | 'ellipse' | 'triangle' | 'unchanged';
+export type SmartDrawingKind = 'line' | 'arrow' | 'rectangle' | 'ellipse' | 'triangle' | 'diamond' | 'parallelogram' | 'trapezoid' | 'star' | 'heart' | 'unchanged';
 export type RecognizedShapeKind = Exclude<SmartDrawingKind, 'unchanged'>;
 
 export interface Bounds {
@@ -27,6 +27,8 @@ export interface SmartDrawingResult {
   /** Fitted endpoints for a line; otherwise the untouched source samples. */
   points: SmartDrawingPoint[];
   bounds?: Bounds;
+  /** Rotation angle in degrees for oriented shapes (e.g. tilted ellipse/rect). */
+  rotation?: number;
   /** World-space vertices for polygonal editable shapes. */
   vertices?: Point2[];
   diagnostics?: CandidateDiagnostic[];
@@ -49,6 +51,7 @@ export interface StrokeFeatures {
   cornerCount: number;
   cornerPoints: Point2[];
   cornerAngles: number[];
+  cornerIndices: number[];
   area: number;
   circularity: number;
   angularCoverage: number;
@@ -104,8 +107,14 @@ export interface GeometryAnalysis {
 export const RECOGNITION_SAMPLE_COUNT = 96;
 export const TEMPLATE_SAMPLE_COUNT = 64;
 export const SMART_DRAWING_THRESHOLDS: Record<RecognizedShapeKind, number> = {
-  line: 0.70,
-  rectangle: 0.69,
-  triangle: 0.68,
-  ellipse: 0.71,
+  line: 0.58,
+  arrow: 0.56,
+  rectangle: 0.56,
+  ellipse: 0.56,
+  triangle: 0.56,
+  diamond: 0.58,
+  parallelogram: 0.58,
+  trapezoid: 0.58,
+  star: 0.58,
+  heart: 0.56,
 };

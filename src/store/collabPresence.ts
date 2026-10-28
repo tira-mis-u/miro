@@ -1,4 +1,5 @@
 import type { Awareness } from 'y-protocols/awareness';
+import { type BoardUserRole, resolveBoardRoleFromUrl } from './boardSecurity';
 
 export interface CollabUser {
   id: string;
@@ -9,12 +10,14 @@ export interface CollabUser {
   gradient: string;
   textColor: string;
   joinedAt: number;
+  role?: BoardUserRole;
 }
 
 export interface CollabCursor {
   x: number;
   y: number;
   lastUpdate: number;
+  isDrawing?: boolean;
 }
 
 export interface CollabReaction {
@@ -27,6 +30,8 @@ export interface CollabReaction {
 
 export interface CollabPresenter {
   active: boolean;
+  startedAt?: number;
+  clientId?: number;
   x: number;
   y: number;
   zoom: number;
@@ -38,6 +43,7 @@ export interface CollabAwarenessState {
   cursor?: CollabCursor | null;
   reaction?: CollabReaction | null;
   presenter?: CollabPresenter | null;
+  roleOverrides?: Record<number, BoardUserRole>;
 }
 
 export interface CollabPeer {
@@ -91,13 +97,58 @@ export function hslToHex(h: number, s: number, l: number): string {
 }
 
 /** Compute WCAG 2.1 relative luminance to determine optimal high-contrast text color */
-export function getContrastTextColor(hex: string): string {
-  const clean = hex.replace('#', '');
-  const r = parseInt(clean.slice(0, 2), 16) / 255;
-  const g = parseInt(clean.slice(2, 4), 16) / 255;
-  const b = parseInt(clean.slice(4, 6), 16) / 255;
-  const lum = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+export function getContrastTextColor(colorStr: string): string {
+  if (!colorStr) return '#ffffff';
+  let r = 0, g = 0, b = 0;
+
+  const rgbMatch = colorStr.match(/rgba?\((\d+)\s*,\s*(\d+)\s*,\s*(\d+)/i);
+  if (rgbMatch) {
+    r = parseInt(rgbMatch[1], 10) / 255;
+    g = parseInt(rgbMatch[2], 10) / 255;
+    b = parseInt(rgbMatch[3], 10) / 255;
+  } else if (colorStr.startsWith('#')) {
+    const clean = colorStr.replace('#', '').trim();
+    if (clean.length === 3) {
+      r = parseInt(clean[0] + clean[0], 16) / 255;
+      g = parseInt(clean[1] + clean[1], 16) / 255;
+      b = parseInt(clean[2] + clean[2], 16) / 255;
+    } else {
+      r = parseInt(clean.slice(0, 2), 16) / 255;
+      g = parseInt(clean.slice(2, 4), 16) / 255;
+      b = parseInt(clean.slice(4, 6), 16) / 255;
+    }
+  }
+
+  const R = Number.isFinite(r) ? r : 0;
+  const G = Number.isFinite(g) ? g : 0;
+  const B = Number.isFinite(b) ? b : 0;
+  const lum = 0.2126 * R + 0.7152 * G + 0.0722 * B;
   return lum > 0.62 ? '#0f172a' : '#ffffff';
+}
+
+/**
+ * Generate a random RGB color in standard "rgb(r, g, b)" format.
+ * Tuned with balanced saturation and luminance for crisp whiteboard contrast.
+ */
+export function getRandomRgbColor(): { primary: string; gradient: string; text: string } {
+  let r = 0, g = 0, b = 0;
+  for (let attempt = 0; attempt < 15; attempt++) {
+    r = Math.floor(Math.random() * 256);
+    g = Math.floor(Math.random() * 256);
+    b = Math.floor(Math.random() * 256);
+    const lum = 0.2126 * (r / 255) + 0.7152 * (g / 255) + 0.0722 * (b / 255);
+    // Ensure visibility on light canvas (avoiding washed out pastel white/light yellow)
+    if (lum >= 0.12 && lum <= 0.78) {
+      break;
+    }
+  }
+  const primary = `rgb(${r}, ${g}, ${b})`;
+  const text = getContrastTextColor(primary);
+  return {
+    primary,
+    gradient: `linear-gradient(135deg, ${primary}, ${primary})`,
+    text,
+  };
 }
 
 /**
@@ -141,15 +192,15 @@ export function getPaletteForIndex(index: number) {
  * Resolve an anonymous user ensuring that:
  * 1. The anonymous number is the lowest available free slot (1, 2, 3...)
  * 2. The color is completely unique and NEVER collides with any currently online peer.
- * 3. In the extreme case of tens of thousands of users saturating the 28,800+ color space,
- *    gracefully falls back to random selection.
+ * 3. Defaults to random RGB color formatted as "rgb(r, g, b)".
  */
 export function resolveAnonymousUser(
   takenNumbers: Set<number>,
   takenColors?: Set<string>,
   preferredNum?: number,
   preserveJoinedAt?: number,
-  preferredColor?: string
+  preferredColor?: string,
+  useRandomRgb = true
 ): CollabUser {
   // 1. Resolve lowest available anonymous number
   let chosenNum = preferredNum && preferredNum >= 1 && !takenNumbers.has(preferredNum) ? preferredNum : 0;
@@ -183,14 +234,24 @@ export function resolveAnonymousUser(
     };
   }
 
-  // Otherwise, search for the next available distinct color
+  // Otherwise, if random RGB is enabled (default), generate a random RGB color!
+  if (!selectedPalette && useRandomRgb) {
+    let candidate = getRandomRgbColor();
+    for (let attempts = 0; attempts < 25; attempts++) {
+      if (!normalizedTakenColors.has(candidate.primary.toLowerCase())) {
+        break;
+      }
+      candidate = getRandomRgbColor();
+    }
+    selectedPalette = candidate;
+  }
+
+  // Otherwise, fallback to the deterministic palette corresponding to the chosenNum
   if (!selectedPalette) {
-    // First try the candidate corresponding to the chosenNum
     const candidateDefault = generateDistinctColor(chosenNum);
     if (!normalizedTakenColors.has(candidateDefault.primary.toLowerCase())) {
       selectedPalette = candidateDefault;
     } else {
-      // Find the first unallocated distinct color in the spectrum
       for (let cand = 1; cand <= MAX_DISTINCT_COLORS; cand++) {
         const pal = generateDistinctColor(cand);
         if (!normalizedTakenColors.has(pal.primary.toLowerCase())) {
@@ -199,10 +260,8 @@ export function resolveAnonymousUser(
         }
       }
 
-      // If all distinct colors are exhausted (> 28,800 concurrent users), fall back to random
       if (!selectedPalette) {
-        const randIndex = Math.floor(Math.random() * MAX_DISTINCT_COLORS) + 1;
-        selectedPalette = generateDistinctColor(randIndex);
+        selectedPalette = getRandomRgbColor();
       }
     }
   }
@@ -225,6 +284,7 @@ export function resolveAnonymousUser(
     gradient: selectedPalette.gradient,
     textColor: selectedPalette.text,
     joinedAt: preserveJoinedAt ?? Date.now(),
+    role: resolveBoardRoleFromUrl(),
   };
 }
 
@@ -232,12 +292,25 @@ let activeAwareness: Awareness | null = null;
 let localCollabUser: CollabUser | null = null;
 let changeHandlerAttached = false;
 let lastCursorBroadcast = 0;
-let pendingCursor: { x: number; y: number } | null = null;
+let pendingCursor: { x: number; y: number; isDrawing?: boolean } | null = null;
 let rafHandle: number | null = null;
 const listeners = new Set<() => void>();
 
 function notifyListeners() {
   listeners.forEach(fn => fn());
+}
+
+function getStoredUserPreferences(): { preferredNum?: number; preferredColor?: string } {
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      const rawNum = window.sessionStorage.getItem(STORAGE_KEY_NUM);
+      const preferredNum = rawNum ? parseInt(rawNum, 10) : undefined;
+      const rawColor = window.sessionStorage.getItem(STORAGE_KEY_COLOR);
+      const preferredColor = rawColor || undefined;
+      return { preferredNum: Number.isNaN(preferredNum) ? undefined : preferredNum, preferredColor };
+    }
+  } catch {}
+  return {};
 }
 
 export function initCollabPresence(awareness: Awareness): CollabUser {
@@ -260,18 +333,7 @@ export function initCollabPresence(awareness: Awareness): CollabUser {
   });
 
   if (!localCollabUser) {
-    let preferredNum: number | undefined;
-    let preferredColor: string | undefined;
-    try {
-      if (typeof window !== 'undefined' && window.sessionStorage) {
-        const rawNum = window.sessionStorage.getItem(STORAGE_KEY_NUM);
-        if (rawNum) preferredNum = parseInt(rawNum, 10);
-        const rawColor = window.sessionStorage.getItem(STORAGE_KEY_COLOR);
-        if (rawColor) preferredColor = rawColor;
-      }
-    } catch {
-      // Ignore
-    }
+    const { preferredNum, preferredColor } = getStoredUserPreferences();
     localCollabUser = resolveAnonymousUser(takenNumbers, takenColors, preferredNum, undefined, preferredColor);
   }
 
@@ -323,8 +385,16 @@ export function initCollabPresence(awareness: Awareness): CollabUser {
   return localCollabUser;
 }
 
-export function getLocalCollabUser(): CollabUser | null {
+export function ensureLocalCollabUser(): CollabUser {
+  if (!localCollabUser) {
+    const { preferredNum, preferredColor } = getStoredUserPreferences();
+    localCollabUser = resolveAnonymousUser(new Set(), new Set(), preferredNum, undefined, preferredColor, !preferredColor);
+  }
   return localCollabUser;
+}
+
+export function getLocalCollabUser(): CollabUser {
+  return ensureLocalCollabUser();
 }
 
 export function getLocalCollabReaction(): CollabReaction | null {
@@ -339,6 +409,38 @@ export function getLocalCollabPresenter(): CollabPresenter | null {
   return s?.presenter ?? null;
 }
 
+export function getEffectivePeerRole(peerClientId: number, fallbackRole: BoardUserRole = 'editor'): BoardUserRole {
+  if (!activeAwareness) return fallbackRole;
+  const states = activeAwareness.getStates();
+  for (const [, st] of states) {
+    const overrides = (st as CollabAwarenessState)?.roleOverrides;
+    if (overrides && overrides[peerClientId]) {
+      return overrides[peerClientId];
+    }
+  }
+  return fallbackRole;
+}
+
+export function broadcastCollabRoleOverride(targetClientId: number, role: BoardUserRole) {
+  if (!activeAwareness) return;
+  const current = (activeAwareness.getLocalState() as CollabAwarenessState)?.roleOverrides || {};
+  activeAwareness.setLocalStateField('roleOverrides', {
+    ...current,
+    [targetClientId]: role,
+  });
+  notifyListeners();
+}
+
+export function updateLocalCollabRole(role: BoardUserRole) {
+  if (localCollabUser) {
+    localCollabUser = { ...localCollabUser, role };
+  }
+  if (activeAwareness) {
+    activeAwareness.setLocalStateField('user', localCollabUser);
+  }
+  notifyListeners();
+}
+
 export function getCollabPeers(): CollabPeer[] {
   if (!activeAwareness) return [];
   const myId = activeAwareness.clientID;
@@ -349,9 +451,10 @@ export function getCollabPeers(): CollabPeer[] {
     if (clientId === myId) return;
     const s = state as CollabAwarenessState | undefined;
     if (s && s.user) {
+      const effectiveRole = getEffectivePeerRole(clientId, s.user.role ?? 'editor');
       peers.push({
         clientId,
-        user: s.user,
+        user: { ...s.user, role: effectiveRole },
         cursor: s.cursor ?? null,
         reaction: s.reaction ?? null,
         presenter: s.presenter ?? null,
@@ -385,7 +488,7 @@ export function broadcastCollabPresenter(state: CollabPresenter | null) {
   activeAwareness.setLocalStateField('presenter', state);
 }
 
-export function broadcastCollabCursor(worldPos: { x: number; y: number } | null) {
+export function broadcastCollabCursor(worldPos: { x: number; y: number } | null, isDrawing = false) {
   if (!activeAwareness) return;
 
   if (worldPos === null) {
@@ -394,10 +497,10 @@ export function broadcastCollabCursor(worldPos: { x: number; y: number } | null)
     return;
   }
 
-  pendingCursor = worldPos;
+  pendingCursor = { ...worldPos, isDrawing };
   const now = performance.now();
-  // Throttle to max ~30 updates per second (~33ms)
-  if (now - lastCursorBroadcast >= 33) {
+  // 60fps throttle (~16ms) for fluid cursor tracking
+  if (now - lastCursorBroadcast >= 16) {
     flushPendingCursor();
   } else if (!rafHandle) {
     rafHandle = window.requestAnimationFrame(() => {
@@ -414,6 +517,7 @@ function flushPendingCursor() {
     x: Math.round(pendingCursor.x * 10) / 10,
     y: Math.round(pendingCursor.y * 10) / 10,
     lastUpdate: Date.now(),
+    ...(pendingCursor.isDrawing ? { isDrawing: true } : {}),
   };
   activeAwareness.setLocalStateField('cursor', cursorData);
 }

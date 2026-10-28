@@ -15,6 +15,7 @@ import type { BehavioralNodeRole, Cardinality, ConnectionPointKind, ConnectorSha
 export const LEGACY_RAW_TYPES = [
   'pen', 'line', 'curve', 'rect', 'rounded-rect', 'ellipse', 'triangle', 'diamond', 'star', 'callout',
   'pentagon', 'hexagon', 'parallelogram', 'trapezoid', 'right-triangle', 'document', 'arrow', 'sticky', 'text', 'math', 'code', 'image',
+  'video', 'link-card',
 ] as const;
 export type LegacyRawType = typeof LEGACY_RAW_TYPES[number];
 const OLD_SHAPE_TYPES = new Set<string>(LEGACY_RAW_TYPES);
@@ -638,7 +639,7 @@ export function deserializeBoardShape(mapKey: string, raw: unknown): Record<stri
     return { ...raw, id, type, pts, color: safeColor(raw.color, '#1e40af'), sw: finite(raw.sw) ? Math.max(0, Math.min(64, raw.sw)) : 2,
       minX: Math.min(...xs), minY: Math.min(...ys), maxX: Math.max(...xs), maxY: Math.max(...ys) };
   }
-  if (['rect', 'rounded-rect', 'ellipse', 'triangle', 'diamond', 'star', 'callout', 'pentagon', 'hexagon', 'parallelogram', 'trapezoid', 'right-triangle', 'document'].includes(type) || ['sticky', 'text', 'math', 'code', 'image'].includes(type)) {
+  if (['rect', 'rounded-rect', 'ellipse', 'triangle', 'diamond', 'star', 'callout', 'pentagon', 'hexagon', 'parallelogram', 'trapezoid', 'right-triangle', 'document'].includes(type) || ['sticky', 'text', 'math', 'code', 'image', 'video', 'link-card'].includes(type)) {
     if (!finite(raw.x) || !finite(raw.y)) return null;
     const x = raw.x, y = raw.y, w = safeSize(raw.w), h = safeSize(raw.h);
     const rotation = normalizeRotation(raw.rotation);
@@ -652,6 +653,8 @@ export function deserializeBoardShape(mapKey: string, raw: unknown): Record<stri
       ...(type === 'image' && typeof raw.src !== 'string' ? { src: '' } : {}),
       ...(type === 'image' && !finite(raw.naturalW) ? { naturalW: w } : {}),
       ...(type === 'image' && !finite(raw.naturalH) ? { naturalH: h } : {}),
+      ...(type === 'video' && typeof raw.src !== 'string' ? { src: '' } : {}),
+      ...(type === 'link-card' && typeof raw.url !== 'string' ? { url: '' } : {}),
       ...(['rect', 'rounded-rect', 'ellipse', 'triangle', 'diamond', 'star', 'callout', 'pentagon', 'hexagon', 'parallelogram', 'trapezoid', 'right-triangle', 'document'].includes(type) ? {
         fill: safeColor(raw.fill, 'transparent'), stroke: safeColor(raw.stroke, '#1e40af'), sw: finite(raw.sw) ? Math.max(0, Math.min(64, raw.sw)) : 2,
         ...(legacyVertices?.length ? { vertices: legacyVertices } : { vertices: undefined }),

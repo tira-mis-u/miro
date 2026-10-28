@@ -172,7 +172,7 @@ function wordNodes(word: string): FormulaNode[] {
 const LEGACY_STRUCTURE_COMMANDS = new Set(['pmatrix3x3', 'pmatrix2x3']);
 
 function parseWord(clean: string, tokens: Token[], start: number, explicit: boolean): { node: FormulaNode; nextIndex: number } {
-  if (explicit && (TELEX_STRUCTURES.includes(clean) || LEGACY_STRUCTURE_COMMANDS.has(clean))) return parseStructure(clean, tokens, start);
+  if ((explicit && (TELEX_STRUCTURES.includes(clean) || clean === 'text')) || LEGACY_STRUCTURE_COMMANDS.has(clean)) return parseStructure(clean, tokens, start);
   if (explicit && Object.prototype.hasOwnProperty.call(TELEX_SYMBOLS, clean)) {
     return { node: createSymbol(TELEX_SYMBOLS[clean]), nextIndex: start };
   }
@@ -186,6 +186,13 @@ export function parseTokensToAST(tokens: Token[]): FormulaNode {
   let index = 0;
   while (index < tokens.length) {
     const token = tokens[index];
+    if (token.type === 'word' && token.explicit && token.value === 'left') {
+      const nextIdx = skipSpaces(tokens, index + 1);
+      if (tokens[nextIdx]?.type === 'operator' && ['(', '[', '{'].includes(tokens[nextIdx].value)) {
+        index = nextIdx;
+        continue;
+      }
+    }
     if (token.type === 'space') { children.push(createText(token.value)); index++; continue; }
     if (token.type === 'number') { children.push(createNumber(token.value)); index++; continue; }
     if (token.type === 'word') {
@@ -465,6 +472,12 @@ function parseStructure(name: string, tokens: Token[], startIndex: number): { no
     case 'log': case 'ln': case 'exp': {
       return { node: createSymbol(TELEX_SYMBOLS[name]), nextIndex: startIndex };
     }
+    case 'text': {
+      const group = collectGroupTokens(tokens, startIndex);
+      if (!group) return { node: createText(''), nextIndex: startIndex };
+      const raw = group.tokens.map(token => token.value).join('');
+      return { node: createText(raw), nextIndex: group.nextIndex };
+    }
     default: {
       if (Object.prototype.hasOwnProperty.call(TELEX_SYMBOLS, name)) return { node: createSymbol(TELEX_SYMBOLS[name]), nextIndex: startIndex };
       return { node: createRow(wordNodes(name)), nextIndex: startIndex };
@@ -627,6 +640,11 @@ function parseUntilClose(tokens: Token[], startIndex: number, closeCharacter: st
       if (token.value === closeCharacter) {
         depth--;
         if (depth === 0) {
+          let endIdx = collected.length - 1;
+          while (endIdx >= 0 && collected[endIdx].type === 'space') endIdx--;
+          if (endIdx >= 0 && collected[endIdx].type === 'word' && collected[endIdx].explicit && collected[endIdx].value === 'right') {
+            collected.splice(endIdx, collected.length - endIdx);
+          }
           index++;
           break;
         }

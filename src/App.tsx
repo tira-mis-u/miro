@@ -1,12 +1,12 @@
 import * as React from 'react';
-import { useEffect, useLayoutEffect, useRef, useState, useCallback, useSyncExternalStore } from 'react';
+import { useEffect, useLayoutEffect, useRef, useState, useCallback, useMemo, useSyncExternalStore } from 'react';
 import { createPortal } from 'react-dom';
 import {
   MousePointer2, PenLine, Eraser, StickyNote, Type, Sparkles,
   ImageIcon, Undo2, Redo2, ZoomIn, ZoomOut, Maximize2,
   Share2, Play, Timer, Video, MessageSquare, MoreHorizontal,
   Copy, Trash2, Palette, X, ChevronDown, Check, Search,
-  Code, Calculator, LassoSelect, Star, Clock, Database, Plus, ArrowUp, ArrowDown, Smile
+  Code, Calculator, LassoSelect, Star, Clock, Database, Plus, ArrowUp, ArrowDown, Smile, Lock
 } from 'lucide-react';
 import { CanvasEngine, getConnectorRoute, isFixedShapeLabel } from './engine/CanvasEngine';
 import type { ToolType, StickyShape, AnyShape } from './engine/CanvasEngine';
@@ -23,13 +23,19 @@ import { searchShapeDefinitions } from './engine/shapes/search';
 import { solid3DLocalAxisSpans, solid3DLocalDimensions, solid3DScaleFromBounds, solid3DSizeSemantics, type Solid3DGeometry, type Solid3DScale } from './engine/shapes/solid3d';
 import { getCanvasShortcutAction } from './engine/keyboardShortcuts';
 import {
+  BOARD_ID,
   continueWithoutLocalRecovery, getBoardRuntimeStatus, initializeBoardStore, subscribeBoardRuntimeStatus, yShapes,
 } from './store/useBoardStore';
 import { RemoteCursorsOverlay } from './components/collab/RemoteCursorsOverlay';
+import { ShareModal } from './components/collab/ShareModal';
+import { resolveBoardRoleFromUrl, type BoardUserRole } from './store/boardSecurity';
 import {
   broadcastCollabCursor,
   broadcastCollabPresenter,
   broadcastCollabReaction,
+  broadcastCollabRoleOverride,
+  getEffectivePeerRole,
+  updateLocalCollabRole,
   getCollabPeers,
   getLocalCollabUser,
   subscribeCollabPresence,
@@ -40,7 +46,7 @@ import BoardStatusBanner from './store/BoardStatusBanner';
 import FormulaEditor from './formula/FormulaEditor';
 import FormulaEditorBoundary from './formula/FormulaEditorBoundary';
 import { DEFAULT_CODE_LANGUAGE, normalizeCodeLanguage, type CodeLanguage } from './code/languages';
-import { HIGH_CONTRAST_CURSORS, visibleCursor } from './cursors';
+import { getCustomCursors, visibleCursor } from './cursors';
 import type { LucideIcon } from 'lucide-react';
 
 const CodeEditor = React.lazy(() => import('./code/CodeEditor'));
@@ -386,12 +392,40 @@ export default function App() {
   const nameRef = useRef<HTMLInputElement>(null);
   // store last image-drop position
   const imgPosRef = useRef({ x: 0, y: 0 });
+  const mouseClientRef = useRef<{ x: number; y: number } | null>(null);
 
   const [tool, setToolSt] = useState<ToolType>('pen');
   const [zoom, setZoom] = useState(1);
   const [cam, setCam] = useState({ x: 0, y: 0, zoom: 1 }); // Sync camera to React for overlays
-  const [cursor, setCursor] = useState('crosshair');
-  const renderedCursor = visibleCursor(cursor);
+  // Real-time Anonymous User & Presence
+  const [collabUser, setCollabUser] = useState<CollabUser | null>(() => getLocalCollabUser());
+  const collabUserRef = useRef(collabUser);
+  collabUserRef.current = collabUser;
+
+  const [cursor, setCursor] = useState('default');
+  const userColor = collabUser?.color || '#2563eb';
+  const renderedCursor = visibleCursor(cursor, userColor);
+  const customCursors = useMemo(() => getCustomCursors(userColor), [userColor]);
+  const [showMorePeers, setShowMorePeers] = useState(false);
+  const morePeersRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!showMorePeers) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (morePeersRef.current && !morePeersRef.current.contains(e.target as Node)) {
+        setShowMorePeers(false);
+      }
+    };
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setShowMorePeers(false);
+    };
+    window.addEventListener('mousedown', handleClickOutside);
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.removeEventListener('mousedown', handleClickOutside);
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [showMorePeers]);
   const [boardName, setBoardName] = useState('Untitled');
   const [editName, setEditName] = useState(false);
   const [selIds, setSelIds] = useState<string[]>([]);
@@ -405,10 +439,6 @@ export default function App() {
   const [ddlDialect, setDdlDialect] = useState<DdlDialect>('postgresql');
   const [ddlCopied, setDdlCopied] = useState(false);
 
-  // Real-time Anonymous User & Presence
-  const [collabUser, setCollabUser] = useState<CollabUser | null>(() => getLocalCollabUser());
-  const collabUserRef = useRef(collabUser);
-  collabUserRef.current = collabUser;
   const [collabPeers, setCollabPeers] = useState<CollabPeer[]>(() => getCollabPeers());
 
   // Miro-standard Follow Collaborator Mode ("Screen Following")
@@ -420,21 +450,83 @@ export default function App() {
   const [isPresenting, setIsPresenting] = useState(false);
   const isPresentingRef = useRef(isPresenting);
   isPresentingRef.current = isPresenting;
+  const myPresentationStartedAtRef = useRef<number>(0);
   const [followingPresenter, setFollowingPresenter] = useState(true);
+  const [takeoverNotice, setTakeoverNotice] = useState<string | null>(null);
+  const takeoverTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Live Floating Emoji Reactions
   const [showReactionPicker, setShowReactionPicker] = useState(false);
   const lastMouseWorldPosRef = useRef<{ x: number; y: number } | null>(null);
 
+  // Share Board Modal
+  const [isShareModalOpen, setIsShareModalOpen] = useState(false);
+
+  // Strict Permission & Access Control (Owner / Editor / Commenter / Viewer)
+  const [userRole, setUserRole] = useState<BoardUserRole>(() => resolveBoardRoleFromUrl());
+  const isReadOnly = userRole === 'viewer' || userRole === 'commenter';
+  const isReadOnlyRef = useRef(isReadOnly);
+  isReadOnlyRef.current = isReadOnly;
+
+  useEffect(() => {
+    if (engRef.current) {
+      engRef.current.isReadOnly = isReadOnly;
+    }
+    if (isReadOnly && tool !== 'select') {
+      setTool('select');
+    }
+  }, [isReadOnly, tool]);
+
   useEffect(() => {
     return subscribeCollabPresence(() => {
-      setCollabUser(getLocalCollabUser());
+      const u = getLocalCollabUser();
+      setCollabUser(u);
       setCollabPeers(getCollabPeers());
+      if (u) {
+        const effective = getEffectivePeerRole(u.anonymousNumber, u.role ?? resolveBoardRoleFromUrl());
+        if (effective !== userRole) {
+          setUserRole(effective);
+          updateLocalCollabRole(effective);
+          setTakeoverNotice(
+            effective === 'viewer'
+              ? '📢 Quyền truy cập: Chỉ xem (View only)'
+              : effective === 'commenter'
+              ? '📢 Quyền truy cập: Người bình luận (Commenter)'
+              : '📢 Bạn đã được cấp quyền Chỉnh sửa (Editor)'
+          );
+          setTimeout(() => setTakeoverNotice(null), 3500);
+        }
+      }
     });
-  }, []);
+  }, [userRole]);
 
   const followingPeer = collabPeers.find(p => p.clientId === followingPeerId);
-  const activeRemotePresenter = collabPeers.find(p => p.presenter && p.presenter.active);
+
+  // Identify active remote presenter by newest startedAt
+  const activeRemotePresenter = useMemo(() => {
+    const presenters = collabPeers.filter(p => p.presenter && p.presenter.active);
+    if (presenters.length === 0) return null;
+    presenters.sort((a, b) => (b.presenter?.startedAt ?? 0) - (a.presenter?.startedAt ?? 0));
+    return presenters[0];
+  }, [collabPeers]);
+
+  // Single Presenter Lock / Graceful Takeover
+  useEffect(() => {
+    if (!activeRemotePresenter?.presenter) return;
+    const remote = activeRemotePresenter.presenter;
+    const remoteStartedAt = remote.startedAt ?? 0;
+
+    // If local user is currently presenting, but another user took over with a newer startedAt:
+    if (isPresentingRef.current && remoteStartedAt > myPresentationStartedAtRef.current) {
+      isPresentingRef.current = false;
+      setIsPresenting(false);
+      myPresentationStartedAtRef.current = 0;
+      setFollowingPresenter(true);
+      setTakeoverNotice(`${activeRemotePresenter.user.name} đã tiếp quản buổi thuyết trình`);
+      if (takeoverTimeoutRef.current) clearTimeout(takeoverTimeoutRef.current);
+      takeoverTimeoutRef.current = setTimeout(() => setTakeoverNotice(null), 4000);
+    }
+  }, [activeRemotePresenter]);
 
   // Auto track followed collaborator's cursor/position
   useEffect(() => {
@@ -449,31 +541,46 @@ export default function App() {
     }
   }, [followingPeerId, collabPeers]);
 
-  // Auto track remote presenter's camera
+  // Auto track remote presenter's camera - NEVER track while local user is presenting!
   useEffect(() => {
-    if (!activeRemotePresenter?.presenter || !followingPresenter || !engRef.current) return;
-    const p = activeRemotePresenter.presenter;
+    if (!engRef.current) return;
+    const p = activeRemotePresenter?.presenter;
+    if (isPresenting || !p || !p.active || !followingPresenter) return;
     engRef.current.setCamera(p.x, p.y, p.zoom);
-  }, [activeRemotePresenter?.presenter, followingPresenter]);
+  }, [
+    isPresenting,
+    activeRemotePresenter?.presenter?.x,
+    activeRemotePresenter?.presenter?.y,
+    activeRemotePresenter?.presenter?.zoom,
+    activeRemotePresenter?.presenter?.active,
+    activeRemotePresenter?.presenter?.startedAt,
+    followingPresenter,
+  ]);
 
   const togglePresenting = useCallback(() => {
-    setIsPresenting(prev => {
-      const next = !prev;
-      if (next) {
-        if (engRef.current && collabUserRef.current) {
-          broadcastCollabPresenter({
-            active: true,
-            x: Math.round(engRef.current.cam.x * 10) / 10,
-            y: Math.round(engRef.current.cam.y * 10) / 10,
-            zoom: Math.round(engRef.current.cam.zoom * 100) / 100,
-            presenterName: collabUserRef.current.name,
-          });
-        }
-      } else {
-        broadcastCollabPresenter(null);
+    const next = !isPresentingRef.current;
+    isPresentingRef.current = next;
+    setIsPresenting(next);
+    if (next) {
+      const now = Date.now();
+      myPresentationStartedAtRef.current = now;
+      setFollowingPresenter(false);
+      setFollowingPeerId(null);
+      if (engRef.current && collabUserRef.current) {
+        broadcastCollabPresenter({
+          active: true,
+          startedAt: now,
+          clientId: collabUserRef.current.anonymousNumber,
+          x: Math.round(engRef.current.cam.x * 10) / 10,
+          y: Math.round(engRef.current.cam.y * 10) / 10,
+          zoom: Math.round(engRef.current.cam.zoom * 100) / 100,
+          presenterName: collabUserRef.current.name,
+        });
       }
-      return next;
-    });
+    } else {
+      myPresentationStartedAtRef.current = 0;
+      broadcastCollabPresenter(null);
+    }
   }, []);
 
   const handleSendReaction = useCallback((emoji: string) => {
@@ -594,6 +701,11 @@ export default function App() {
   const isSwitchingToolRef = useRef(false);
 
   const setTool = useCallback((t: ToolType, keepOpen: boolean = false, contextCategory?: ShapeCategory, preserveSelection: boolean = false, isAutoSwitch: boolean = false) => {
+    if (isReadOnlyRef.current && t !== 'select') {
+      setTakeoverNotice('🔒 Chế độ chỉ xem: Bạn không có quyền chỉnh sửa board này.');
+      setTimeout(() => setTakeoverNotice(null), 3000);
+      return;
+    }
     isSwitchingToolRef.current = true;
     try {
       setToolSt(t);
@@ -814,8 +926,11 @@ export default function App() {
     // The style-sync effect may already have run while board restoration was pending.
     // Apply the current UI values at construction so new shapes use Antiwhite defaults.
     eng.style = { ...engineStyleRef.current };
+    eng.isReadOnly = isReadOnlyRef.current;
     engRef.current = eng;
-    (window as unknown as { eng?: CanvasEngine }).eng = eng;
+    if (import.meta.env.DEV || (typeof window !== 'undefined' && Boolean((window as unknown as { __ENABLE_TEST_ENGINE__?: boolean }).__ENABLE_TEST_ENGINE__))) {
+      (window as unknown as { eng?: CanvasEngine }).eng = eng;
+    }
 
     eng.onSel = ids => {
       setSelIds(ids);
@@ -838,6 +953,8 @@ export default function App() {
       if (isPresentingRef.current && collabUserRef.current) {
         broadcastCollabPresenter({
           active: true,
+          startedAt: myPresentationStartedAtRef.current,
+          clientId: collabUserRef.current.anonymousNumber,
           x: Math.round(c.x * 10) / 10,
           y: Math.round(c.y * 10) / 10,
           zoom: Math.round(c.zoom * 100) / 100,
@@ -847,19 +964,6 @@ export default function App() {
     };
     eng.onZoom = (z) => {
       setZoom(z);
-      setCam(prev => {
-        const next = { ...prev, zoom: z };
-        if (isPresentingRef.current && collabUserRef.current) {
-          broadcastCollabPresenter({
-            active: true,
-            x: Math.round(next.x * 10) / 10,
-            y: Math.round(next.y * 10) / 10,
-            zoom: Math.round(z * 100) / 100,
-            presenterName: collabUserRef.current.name,
-          });
-        }
-        return next;
-      });
     };
     eng.onTool = t => {
       setToolSt(t);
@@ -1175,26 +1279,42 @@ export default function App() {
       eng.pointerMove(e);
       if (wrap) {
         const rect = wrap.getBoundingClientRect();
-        if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
+        const inside = e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom;
+        const drawing = eng.isDrawingActive();
+        if (inside || drawing) {
           const world = eng.clientToWorld(e.clientX, e.clientY);
           lastMouseWorldPosRef.current = world;
-          broadcastCollabCursor(world);
+          broadcastCollabCursor(world, drawing);
         } else {
-          broadcastCollabCursor(null);
+          broadcastCollabCursor(null, false);
         }
       }
     };
-    const onUp = (e: PointerEvent) => eng.pointerUp(e);
+    const onUp = (e: PointerEvent) => {
+      eng.pointerUp(e);
+      if (wrap) {
+        const rect = wrap.getBoundingClientRect();
+        if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
+          const world = eng.clientToWorld(e.clientX, e.clientY);
+          lastMouseWorldPosRef.current = world;
+          broadcastCollabCursor(world, false);
+        } else {
+          broadcastCollabCursor(null, false);
+        }
+      }
+    };
     const onCancel = (e: PointerEvent) => {
       eng.cancelPointer(e);
-      broadcastCollabCursor(null);
+      broadcastCollabCursor(null, false);
     };
     const onBlur = () => {
       eng.cancelPointer();
-      broadcastCollabCursor(null);
+      broadcastCollabCursor(null, false);
     };
     const onLeave = () => {
-      broadcastCollabCursor(null);
+      if (!eng.isDrawingActive()) {
+        broadcastCollabCursor(null, false);
+      }
     };
     wrap.addEventListener('pointerleave', onLeave);
     window.addEventListener('pointermove', onMove);
@@ -1222,7 +1342,9 @@ export default function App() {
       eng.cancelPointer();
       eng.destroy();
       engRef.current = null;
-      (window as unknown as { eng?: CanvasEngine | null }).eng = null;
+      if (import.meta.env.DEV || (typeof window !== 'undefined' && Boolean((window as unknown as { __ENABLE_TEST_ENGINE__?: boolean }).__ENABLE_TEST_ENGINE__))) {
+        (window as unknown as { eng?: CanvasEngine | null }).eng = null;
+      }
     };
   }, [boardReady]);
 
@@ -1262,14 +1384,14 @@ export default function App() {
     }
   }, [zoom]);
 
-  const handleFormulaSourceChange = useCallback((source: string, lastValidPreview?: string) => {
+  const handleFormulaSourceChange = useCallback((source: string, lastValidPreview?: string, measuredSize?: { width: number; height: number }) => {
     editTextRef.current = source;
     const current = editShapeRef.current;
     if (current?.type !== 'math') return;
     const stored = yShapes.get(current.id);
     const fallbackPreview = stored?.type === 'math' ? stored.previewText : current.previewText;
     // Source remains authoritative; only a valid preview is allowed to update the board projection.
-    engRef.current?.updateFormulaLive(current.id, source, lastValidPreview ?? fallbackPreview ?? '', false);
+    engRef.current?.updateFormulaLive(current.id, source, lastValidPreview ?? fallbackPreview ?? '', measuredSize, true);
   }, []);
 
   const getLastValidFormulaPreview = useCallback(() => {
@@ -1281,7 +1403,7 @@ export default function App() {
 
   // Math Auto-Replace đã được chuyển sang FormulaEditor component.
 
-  const commitEdit = useCallback((formulaSource?: string, lastValidPreview?: string) => {
+  const commitEdit = useCallback((formulaSource?: string, lastValidPreview?: string, measuredSize?: { width: number; height: number }) => {
     const shape = editShapeRef.current;
     const eng = engRef.current;
     const session = activeEditSessionRef.current;
@@ -1327,7 +1449,7 @@ export default function App() {
       const previewText = lastValidPreview ?? storedPreview;
       const finalSource = committedText.trim() ? committedText : '\\square';
       const finalPreview = previewText.trim() ? previewText : '\\square';
-      eng.updateFormula(shape.id, finalSource, finalPreview);
+      eng.updateFormula(shape.id, finalSource, finalPreview, measuredSize);
     } else if (committedText.trim() === '' && !isFixedShapeLabel(shape) && shape.type !== 'sticky') {
       eng.deleteShape(shape.id);
     } else if (shape.type === 'code') {
@@ -1554,6 +1676,17 @@ export default function App() {
 
       const shortcut = getCanvasShortcutAction(e, eng.sel.size === 0);
       if (!shortcut) return;
+      if (isReadOnlyRef.current && ['undo', 'redo', 'duplicate', 'delete', 'tool', 'open-image'].includes(shortcut.type)) {
+        if (shortcut.type === 'tool' && shortcut.tool === 'select') {
+          // allow switching to select
+        } else {
+          e.preventDefault();
+          setTakeoverNotice('📢 Chế độ chỉ xem: Không thể chỉnh sửa hoặc đổi công cụ vẽ.');
+          setTimeout(() => setTakeoverNotice(null), 2500);
+          return;
+        }
+      }
+
       switch (shortcut.type) {
         case 'pan':
           e.preventDefault();
@@ -1563,6 +1696,7 @@ export default function App() {
         case 'redo': e.preventDefault(); eng.redo(); break;
         case 'select-all': e.preventDefault(); eng.selectAll(); break;
         case 'duplicate': e.preventDefault(); eng.dupSel(); break;
+        case 'copy': e.preventDefault(); eng.copySel(); break;
         case 'delete': e.preventDefault(); eng.deleteSel(); break;
         case 'tool': setTool(shortcut.tool); break;
         case 'open-image': fileRef.current?.click(); break;
@@ -1574,6 +1708,225 @@ export default function App() {
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, [setTool, commitEdit]);
+
+  // Track mouse coordinates for pasting precisely at the cursor location
+  useEffect(() => {
+    const onMouseMove = (e: MouseEvent) => {
+      mouseClientRef.current = { x: e.clientX, y: e.clientY };
+    };
+    window.addEventListener('mousemove', onMouseMove, { passive: true });
+    return () => window.removeEventListener('mousemove', onMouseMove);
+  }, []);
+
+  // Smart Clipboard Paste Handler: recognizes image files, video files, URLs, and shapes
+  useEffect(() => {
+    const handlePaste = (e: ClipboardEvent) => {
+      if (isReadOnlyRef.current) return;
+      const active = document.activeElement as HTMLElement | null;
+      const tag = active?.tagName;
+      const isTypingInNativeInput = tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT'
+        || Boolean(active?.isContentEditable);
+      if (isTypingInNativeInput) return;
+
+      const isInsideSpecialEditor = Boolean(
+        active?.closest('.formula-editor-panel, .math-tools-panel, .code-editor-shell, .code-editor-overlay, .board-text-editor')
+      );
+      if (isInsideSpecialEditor) return;
+
+      const eng = engRef.current;
+      if (!eng) return;
+
+      const cv = canvasRef.current;
+      const rect = cv?.getBoundingClientRect();
+      let cx = window.innerWidth / 2;
+      let cy = window.innerHeight / 2;
+
+      if (rect) {
+        cx = rect.left + rect.width / 2;
+        cy = rect.top + rect.height / 2;
+      }
+      if (mouseClientRef.current) {
+        const mx = mouseClientRef.current.x;
+        const my = mouseClientRef.current.y;
+        if (!rect || (mx >= rect.left && mx <= rect.right && my >= rect.top && my <= rect.bottom)) {
+          cx = mx;
+          cy = my;
+        }
+      }
+
+      // 1. Check Files / Items in Clipboard
+      const files = Array.from(e.clipboardData?.files || []);
+      const items = Array.from(e.clipboardData?.items || []);
+      let videoFile = files.find(f => f.type.startsWith('video/'));
+      let imageFile = files.find(f => f.type.startsWith('image/'));
+
+      if (!videoFile || !imageFile) {
+        for (const item of items) {
+          if (item.kind === 'file') {
+            const f = item.getAsFile();
+            if (f) {
+              if (!videoFile && f.type.startsWith('video/')) videoFile = f;
+              if (!imageFile && f.type.startsWith('image/')) imageFile = f;
+            }
+          }
+        }
+      }
+
+      if (videoFile) {
+        e.preventDefault();
+        const fr = new FileReader();
+        fr.onload = async (ev) => {
+          try {
+            const res = await fetch('/api/media/upload', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ filename: videoFile.name, dataUrl: ev.target?.result }),
+            });
+            if (res.ok) {
+              const data = await res.json() as { url: string };
+              eng.addVideo(data.url, cx, cy, videoFile.name);
+            } else {
+              const objUrl = URL.createObjectURL(videoFile);
+              eng.addVideo(objUrl, cx, cy, videoFile.name);
+            }
+          } catch {
+            const objUrl = URL.createObjectURL(videoFile);
+            eng.addVideo(objUrl, cx, cy, videoFile.name);
+          }
+        };
+        fr.readAsDataURL(videoFile);
+        return;
+      }
+
+      if (imageFile) {
+        e.preventDefault();
+        const fr = new FileReader();
+        fr.onload = async (ev) => {
+          try {
+            const res = await fetch('/api/media/upload', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ filename: imageFile.name, dataUrl: ev.target?.result }),
+            });
+            if (res.ok) {
+              const data = await res.json() as { url: string };
+              eng.addImage(data.url, cx, cy);
+            } else {
+              eng.addImage(ev.target?.result as string, cx, cy);
+            }
+          } catch {
+            eng.addImage(ev.target?.result as string, cx, cy);
+          }
+        };
+        fr.readAsDataURL(imageFile);
+        return;
+      }
+
+      // 2. Check Text / URL in Clipboard
+      const text = (e.clipboardData?.getData('text/plain') || '').trim();
+      if (text) {
+        const isUrl = /^https?:\/\/[^\s]+$/i.test(text);
+        if (isUrl) {
+          e.preventDefault();
+          // Direct Image URL
+          if (/\.(png|jpe?g|webp|gif|svg)(\?.*)?$/i.test(text)) {
+            eng.addImage(text, cx, cy);
+            return;
+          }
+          // Direct Video URL
+          if (/\.(mp4|webm|ogg|mov)(\?.*)?$/i.test(text)) {
+            eng.addVideo(text, cx, cy);
+            return;
+          }
+
+          // Web / Social URL (YouTube, Facebook, Twitter, GitHub, etc.)
+          let initialDomain = '';
+          try { initialDomain = new URL(text).hostname.replace(/^www\./i, ''); } catch { /* ignore */ }
+          const isYt = text.includes('youtube.com') || text.includes('youtu.be');
+          let ytThumb = '';
+          if (isYt) {
+            const m = text.match(/(?:youtube\.com\/(?:[^\/]+\/.+\/|(?:v|e(?:mbed)?)\/|.*[?&]v=)|youtu\.be\/|youtube\.com\/shorts\/)([^"&?\/\s]{11})/i);
+            if (m?.[1]) {
+              ytThumb = `https://img.youtube.com/vi/${m[1]}/hqdefault.jpg`;
+            }
+          }
+
+          const cardId = eng.addLinkCard(text, cx, cy, {
+            status: 'loading',
+            siteName: isYt ? 'YouTube' : initialDomain,
+            image: ytThumb,
+            mediaType: isYt ? 'video' : 'website',
+          });
+
+          void (async () => {
+            try {
+              const res = await fetch(`/api/link-preview?url=${encodeURIComponent(text)}`);
+              if (res.ok) {
+                const meta = await res.json() as {
+                  title?: string;
+                  description?: string;
+                  image?: string;
+                  favicon?: string;
+                  siteName?: string;
+                  mediaType?: 'website' | 'video' | 'article' | 'image';
+                  embedUrl?: string;
+                };
+                eng.updateLinkCardMeta(cardId, {
+                  status: 'ready',
+                  title: meta.title,
+                  description: meta.description,
+                  image: meta.image || ytThumb,
+                  favicon: meta.favicon,
+                  siteName: meta.siteName || initialDomain,
+                  mediaType: meta.mediaType,
+                  embedUrl: meta.embedUrl,
+                });
+              } else {
+                eng.updateLinkCardMeta(cardId, {
+                  status: 'ready',
+                  title: initialDomain || text,
+                  description: text,
+                  image: ytThumb,
+                  siteName: initialDomain,
+                  favicon: `https://www.google.com/s2/favicons?domain=${initialDomain}&sz=64`,
+                });
+              }
+            } catch {
+              eng.updateLinkCardMeta(cardId, {
+                status: 'ready',
+                title: initialDomain || text,
+                description: text,
+                image: ytThumb,
+                siteName: initialDomain,
+              });
+            }
+          })();
+          return;
+        }
+
+        // Internal clipboard has copied shapes
+        if (eng.hasInternalClipboard()) {
+          e.preventDefault();
+          eng.pasteInternal(cx, cy);
+          return;
+        }
+
+        // Plain text pasted onto canvas -> create Sticky Note
+        e.preventDefault();
+        eng.addSticky(text, cx, cy);
+        return;
+      }
+
+      // 3. Fallback: Check internal canvas clipboard
+      if (eng.hasInternalClipboard()) {
+        e.preventDefault();
+        eng.pasteInternal(cx, cy);
+      }
+    };
+
+    window.addEventListener('paste', handlePaste);
+    return () => window.removeEventListener('paste', handlePaste);
+  }, []);
 
   const resizeFormula = useCallback((width: number, height: number) => {
     const id = editShapeRef.current?.id;
@@ -1869,11 +2222,11 @@ export default function App() {
 
   return (
     <div className="app-shell flex flex-col overflow-hidden select-none" style={{
-      '--aw-cursor-pointer': HIGH_CONTRAST_CURSORS.pointer,
-      '--aw-cursor-text': HIGH_CONTRAST_CURSORS.text,
-      '--aw-cursor-grab': HIGH_CONTRAST_CURSORS.grab,
-      '--aw-cursor-grabbing': HIGH_CONTRAST_CURSORS.grabbing,
-      '--aw-cursor-move': HIGH_CONTRAST_CURSORS.move,
+      '--aw-cursor-pointer': customCursors.pointer,
+      '--aw-cursor-text': customCursors.text,
+      '--aw-cursor-grab': customCursors.grab,
+      '--aw-cursor-grabbing': customCursors.grabbing,
+      '--aw-cursor-move': customCursors.move,
     } as React.CSSProperties}>
 
       {/* ══ TOPBAR (MIRO INSPIRED) ══════════════════════════════════════════ */}
@@ -1911,7 +2264,7 @@ export default function App() {
         <div className="header-board">
           <span className="header-breadcrumb">Boards</span>
           <span className="header-crumb-separator" aria-hidden="true">/</span>
-          {editName ? (
+          {editName && !isReadOnly ? (
             <input ref={nameRef} value={boardName} aria-label="Board name"
               onChange={e => setBoardName(e.target.value || 'Untitled')}
               onBlur={() => setEditName(false)}
@@ -1919,10 +2272,10 @@ export default function App() {
               className="header-name-input"
               autoFocus />
           ) : (
-            <button onClick={() => { setEditName(true); setTimeout(() => nameRef.current?.select(), 15); }}
-              className="header-board-name group" title="Click to rename board">
+            <button onClick={() => { if (!isReadOnly) { setEditName(true); setTimeout(() => nameRef.current?.select(), 15); } }}
+              className={`header-board-name group ${isReadOnly ? 'cursor-default' : ''}`} title={isReadOnly ? 'Board name (Read only)' : 'Click to rename board'}>
               <span className="header-board-title">{boardName}</span>
-              <ChevronDown size={13} className="header-board-chevron" aria-hidden="true" />
+              {!isReadOnly && <ChevronDown size={13} className="header-board-chevron" aria-hidden="true" />}
             </button>
           )}
 
@@ -1937,55 +2290,148 @@ export default function App() {
             <span className="header-sync-dot" />
             <span className="header-sync-text">Saved</span>
           </div>
+
+          {isReadOnly && (
+            <div className="header-role-badge" title={userRole === 'viewer' ? 'View only: You cannot modify this board' : 'Comment only: You can view and leave reactions'}>
+              <Lock size={12} className="text-amber-600 flex-shrink-0" />
+              <span>{userRole === 'viewer' ? 'View only' : 'Comment only'}</span>
+            </div>
+          )}
         </div>
 
         <div className="header-spacer" />
 
         <div className="header-presence" role="region" aria-label="Online collaborators">
-          {collabPeers.length === 0 ? (
-            <div className="presence-alone-indicator" title="You are currently the only collaborator in this room">
-              <span className="presence-alone-dot" />
-              <span className="presence-alone-label">Solo</span>
+          <div className="presence-avatars">
+            {/* The Local User (You) - Always visible in the presence stack (Slot 1 of max 3) */}
+            <div
+              className="presence-avatar is-self"
+              style={{
+                background: collabUser ? collabUser.gradient : 'linear-gradient(135deg, #2563eb, #1d4ed8)',
+                zIndex: 20,
+              }}
+              title={`You (${collabUser ? collabUser.name : 'Active'})`}
+              aria-label={`You (${collabUser ? collabUser.name : 'Active'})`}
+            >
+              <span>{collabUser ? collabUser.avatarLabel : 'U'}</span>
+              <span className="presence-self-dot" />
+              <div className="presence-avatar-tooltip">
+                You ({collabUser ? collabUser.name : 'Active'})
+              </div>
             </div>
-          ) : (
-            <div className="presence-avatars">
-              {collabPeers.slice(0, 4).map((peer, idx) => {
-                const isFollowed = followingPeerId === peer.clientId;
-                return (
-                  <button
-                    key={peer.clientId}
-                    type="button"
-                    className={`presence-avatar ${isFollowed ? 'is-following' : ''}`}
-                    style={{
-                      background: peer.user.gradient,
-                      zIndex: collabPeers.length - idx,
-                      border: isFollowed ? '2px solid #3b82f6' : '2px solid #ffffff',
-                      cursor: 'pointer',
-                    }}
-                    title={`${peer.user.name} (Active) — ${isFollowed ? 'Click to stop following' : 'Click to follow screen'}`}
-                    aria-label={`${peer.user.name} — ${isFollowed ? 'Stop following' : 'Follow screen'}`}
-                    aria-pressed={isFollowed}
-                    onClick={() => {
-                      if (isFollowed) {
-                        setFollowingPeerId(null);
-                      } else {
-                        setFollowingPeerId(peer.clientId);
-                        if (peer.cursor && engRef.current) {
-                          engRef.current.panTo(peer.cursor.x, peer.cursor.y);
-                        }
+
+            {/* Remote Peers in Overlapping Stack (Up to 2 peers, keeping max 3 avatar slots) */}
+            {collabPeers.slice(0, 2).map((peer, idx) => {
+              const isFollowed = followingPeerId === peer.clientId;
+              return (
+                <button
+                  key={peer.clientId}
+                  type="button"
+                  className={`presence-avatar ${isFollowed ? 'is-following' : ''}`}
+                  style={{
+                    background: peer.user.gradient,
+                    zIndex: 19 - idx,
+                    cursor: 'pointer',
+                  }}
+                  title={`${peer.user.name} (Active) — ${isFollowed ? 'Click to stop following' : 'Click to follow screen'}`}
+                  aria-label={`${peer.user.name} — ${isFollowed ? 'Stop following' : 'Follow screen'}`}
+                  aria-pressed={isFollowed}
+                  onClick={() => {
+                    if (isFollowed) {
+                      setFollowingPeerId(null);
+                    } else {
+                      setFollowingPeerId(peer.clientId);
+                      if (peer.cursor && engRef.current) {
+                        engRef.current.panTo(peer.cursor.x, peer.cursor.y);
                       }
-                    }}
-                  >
-                    {peer.user.avatarLabel}
-                  </button>
-                );
-              })}
+                    }
+                  }}
+                >
+                  <span>{peer.user.avatarLabel}</span>
+                  <div className="presence-avatar-tooltip">
+                    {peer.user.name}{peer.presenter?.active ? ' (Presenting)' : ''}{isFollowed ? ' (Following)' : ''}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+
+          {/* Miro-style Overflow Collaborators Dropdown (When > 2 remote peers, max 3 slots exceeded) */}
+          {collabPeers.length > 2 && (
+            <div className="relative inline-flex items-center" ref={morePeersRef}>
+              <button
+                type="button"
+                className={`presence-more-btn ${showMorePeers ? 'is-open' : ''}`}
+                title={`${collabPeers.length - 2} more collaborators online`}
+                aria-label={`View ${collabPeers.length - 2} more collaborators`}
+                aria-expanded={showMorePeers}
+                onClick={() => setShowMorePeers(prev => !prev)}
+              >
+                <span>+{collabPeers.length - 2}</span>
+                <ChevronDown size={12} className={`presence-more-chevron ${showMorePeers ? 'rotate-180' : ''}`} />
+              </button>
+
+              {showMorePeers && (
+                <div className="presence-dropdown-menu" role="menu">
+                  <div className="presence-dropdown-header">
+                    Collaborators ({collabPeers.length + 1})
+                  </div>
+                  <div className="presence-dropdown-list">
+                    {/* Local User */}
+                    <div className="presence-dropdown-item is-self">
+                      <div
+                        className="presence-dropdown-avatar"
+                        style={{ background: collabUser ? collabUser.gradient : 'linear-gradient(135deg, #2563eb, #1d4ed8)' }}
+                      >
+                        {collabUser ? collabUser.avatarLabel : 'U'}
+                        <span className="presence-self-dot" />
+                      </div>
+                      <div className="presence-dropdown-info">
+                        <span className="presence-dropdown-name">{collabUser ? collabUser.name : 'You'} (You)</span>
+                        <span className="presence-dropdown-status">Active now</span>
+                      </div>
+                    </div>
+
+                    {/* All Remote Collaborators */}
+                    {collabPeers.map(peer => {
+                      const isFollowed = followingPeerId === peer.clientId;
+                      const isPresenting = peer.presenter?.active;
+                      return (
+                        <button
+                          key={peer.clientId}
+                          type="button"
+                          className={`presence-dropdown-item ${isFollowed ? 'is-following' : ''}`}
+                          onClick={() => {
+                            if (isFollowed) {
+                              setFollowingPeerId(null);
+                            } else {
+                              setFollowingPeerId(peer.clientId);
+                              if (peer.cursor && engRef.current) {
+                                engRef.current.panTo(peer.cursor.x, peer.cursor.y);
+                              }
+                            }
+                            setShowMorePeers(false);
+                          }}
+                        >
+                          <div
+                            className="presence-dropdown-avatar"
+                            style={{ background: peer.user.gradient }}
+                          >
+                            {peer.user.avatarLabel}
+                          </div>
+                          <div className="presence-dropdown-info">
+                            <span className="presence-dropdown-name">{peer.user.name}</span>
+                            <span className="presence-dropdown-status">
+                              {isPresenting ? '📢 Presenting' : isFollowed ? '👀 Following' : 'Click to follow'}
+                            </span>
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </div>
+              )}
             </div>
-          )}
-          {collabPeers.length > 4 && (
-            <span className="presence-badge" title={`${collabPeers.length - 4} more collaborators online`}>
-              +{collabPeers.length - 4}
-            </span>
           )}
         </div>
 
@@ -2003,27 +2449,39 @@ export default function App() {
             <Play size={13} strokeWidth={2.4} className="fill-current" />
             <span className="header-action-label">{isPresenting ? 'Stop' : 'Present'}</span>
           </button>
-          <button type="button" disabled title="Sharing is not available yet" aria-label="Share (not available yet)"
-            className="header-action header-action-share">
+          <button
+            type="button"
+            onClick={() => setIsShareModalOpen(true)}
+            title="Share board with collaborators"
+            aria-label="Share board"
+            className="header-action header-action-share"
+          >
             <Share2 size={13} strokeWidth={2.4} />
             <span className="header-action-label">Share</span>
           </button>
-          <div
-            className="header-user-avatar"
-            style={{
-              background: collabUser ? collabUser.gradient : 'linear-gradient(135deg, #2563eb, #1d4ed8)',
-              color: '#ffffff',
-            }}
-            title={collabUser ? `You (${collabUser.name}) — Online` : 'Connecting...'}
-            aria-label={collabUser ? `You (${collabUser.name}) — Online` : 'Connecting...'}
-          >
-            <span>{collabUser ? collabUser.avatarLabel : 'U'}</span>
-            <span className="header-user-online-dot" />
-          </div>
         </div>
       </header>
 
+      {/* Share Board Dialog */}
+      <ShareModal
+        isOpen={isShareModalOpen}
+        onClose={() => setIsShareModalOpen(false)}
+        boardId={BOARD_ID}
+        collabPeers={collabPeers}
+        collabUser={collabUser}
+        onRoleChange={(targetClientId, role) => {
+          broadcastCollabRoleOverride(targetClientId, role);
+        }}
+      />
+
       {/* Miro-style Collaborative Follow & Presenter Floating Overlays */}
+      {takeoverNotice && (
+        <div className="presentation-takeover-toast" role="status" aria-live="polite">
+          <span className="takeover-icon">📢</span>
+          <span>{takeoverNotice}</span>
+        </div>
+      )}
+
       {followingPeer && (
         <div className="following-collab-pill" role="status" aria-live="polite">
           <span className="following-pulse-dot" style={{ backgroundColor: followingPeer.user.color }} />
@@ -2107,125 +2565,131 @@ export default function App() {
               )}
             </div>
 
-            <div className="tool-divider" aria-hidden="true" />
+            {!isReadOnly && (
+              <>
+                <div className="tool-divider" aria-hidden="true" />
 
-            {/* PEN GROUP */}
-            <div ref={el => { popoverAnchorRefs.current.pen = el }} className="tool-group">
-              <SideBtn label="Pen &amp; Smart Drawing" shortcut="P" active={tool === 'pen'} expanded={openGroup === 'pen'} hasSubmenu
-                onClick={() => { const next = openGroup === 'pen' ? null : 'pen'; setOpenGroup(next); if (next) setTool('pen', true); }}>
-                {penMode === 'smart' ? <Sparkles size={23} strokeWidth={2} /> : <PenLine size={23} strokeWidth={2} />}
-              </SideBtn>
-              {openGroup === 'pen' && (
-                <div ref={popoverPanelRef} className="tool-popover tool-popover-list" role="group" aria-label="Pen drawing modes" onKeyDown={handlePopoverNavigation}
-                  style={{ left: popoverPosition?.left ?? -9999, top: popoverPosition?.top ?? -9999 }}>
-                  <div className="tool-popover-heading">Pen mode</div>
-                  <PopoverItem active={penMode === 'normal'} Icon={PenLine} label="Normal" onClick={() => choosePenMode('normal')} />
-                  <PopoverItem active={penMode === 'smart'} Icon={Sparkles} label="Smart Drawing" onClick={() => choosePenMode('smart')} />
+                {/* PEN GROUP */}
+                <div ref={el => { popoverAnchorRefs.current.pen = el }} className="tool-group">
+                  <SideBtn label="Pen &amp; Smart Drawing" shortcut="P" active={tool === 'pen'} expanded={openGroup === 'pen'} hasSubmenu
+                    onClick={() => { const next = openGroup === 'pen' ? null : 'pen'; setOpenGroup(next); if (next) setTool('pen', true); }}>
+                    {penMode === 'smart' ? <Sparkles size={23} strokeWidth={2} /> : <PenLine size={23} strokeWidth={2} />}
+                  </SideBtn>
+                  {openGroup === 'pen' && (
+                    <div ref={popoverPanelRef} className="tool-popover tool-popover-list" role="group" aria-label="Pen drawing modes" onKeyDown={handlePopoverNavigation}
+                      style={{ left: popoverPosition?.left ?? -9999, top: popoverPosition?.top ?? -9999 }}>
+                      <div className="tool-popover-heading">Pen mode</div>
+                      <PopoverItem active={penMode === 'normal'} Icon={PenLine} label="Normal" onClick={() => choosePenMode('normal')} />
+                      <PopoverItem active={penMode === 'smart'} Icon={Sparkles} label="Smart Drawing" onClick={() => choosePenMode('smart')} />
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
 
-            {/* ERASER */}
-            <SideBtn label="Eraser" shortcut="E" active={tool === 'eraser'} onClick={() => setTool('eraser')}>
-              <Eraser size={23} strokeWidth={2} />
-            </SideBtn>
+                {/* ERASER */}
+                <SideBtn label="Eraser" shortcut="E" active={tool === 'eraser'} onClick={() => setTool('eraser')}>
+                  <Eraser size={23} strokeWidth={2} />
+                </SideBtn>
 
-            <div className="tool-divider" aria-hidden="true" />
+                <div className="tool-divider" aria-hidden="true" />
 
-            {/* STICKY */}
-            <SideBtn label="Sticky Note" shortcut="S" active={tool === 'sticky'} onClick={() => setTool('sticky')}>
-              <StickyNote size={23} strokeWidth={2} />
-            </SideBtn>
+                {/* STICKY */}
+                <SideBtn label="Sticky Note" shortcut="S" active={tool === 'sticky'} onClick={() => setTool('sticky')}>
+                  <StickyNote size={23} strokeWidth={2} />
+                </SideBtn>
 
-            {/* TEXT GROUP */}
-            <div ref={el => { popoverAnchorRefs.current.text = el }} className="tool-group">
-              <SideBtn label="Text, Math &amp; Code" shortcut="T" active={['text', 'math', 'code'].includes(tool)} expanded={openGroup === 'text'} hasSubmenu
-                onClick={() => { const next = openGroup === 'text' ? null : 'text'; setOpenGroup(next); if (next) setTool(lastTextTool, true); }}>
-                {(() => {
-                  const active = ['text', 'math', 'code'].includes(tool) ? tool : lastTextTool;
-                  if (active === 'math') return <Calculator size={23} strokeWidth={2} />;
-                  if (active === 'code') return <Code size={23} strokeWidth={2} />;
-                  return <Type size={23} strokeWidth={2.2} />;
-                })()}
-              </SideBtn>
-              {openGroup === 'text' && (
-                <div ref={popoverPanelRef} className="tool-popover tool-popover-list" role="group" aria-label="Text tools" onKeyDown={handlePopoverNavigation}
-                  style={{ left: popoverPosition?.left ?? -9999, top: popoverPosition?.top ?? -9999 }}>
-                  <div className="tool-popover-heading">Text &amp; math</div>
-                  {TEXT_TOOLS.map(t => (
-                    <PopoverItem key={t.id} active={['text', 'math', 'code'].includes(tool) ? tool === t.id : lastTextTool === t.id} Icon={t.Icon} label={t.label} onClick={() => { choosePopoverTool(t.id); }} />
-                  ))}
-                </div>
-              )}
-            </div>
-
-            {/* SHAPES GROUP */}
-            <div ref={el => { popoverAnchorRefs.current.shapes = el }} className="tool-group">
-              <SideBtn label="Shapes &amp; UML" shortcut="O" active={SHAPE_TOOLS.some(s => s.id === tool)} expanded={openGroup === 'shapes'} hasSubmenu
-                onClick={() => { const next = openGroup === 'shapes' ? null : 'shapes'; setOpenGroup(next); if (next) setTool(lastShapeTool, true); }}>
-                {(() => {
-                  const active = SHAPE_TOOLS.some(s => s.id === tool) ? tool : lastShapeTool;
-                  const entry = SHAPE_TOOLS.find(s => s.id === active) ?? SHAPE_TOOLS[0];
-                  return <ShapePreview definition={entry.definition} size={25} />;
-                })()}
-              </SideBtn>
-              {openGroup === 'shapes' && (
-                <div ref={popoverPanelRef} className="tool-popover tool-popover-shapes" role="group" aria-label="Shape tools"
-                  onKeyDown={e => {
-                    if (e.target instanceof HTMLInputElement && ['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight'].includes(e.key)) return;
-                    handlePopoverNavigation(e);
-                  }}
-                  style={{ left: popoverPosition?.left ?? -9999, top: popoverPosition?.top ?? -9999 }}>
-                  <label className="shape-library-search">
-                    <Search size={14} aria-hidden="true" />
-                    <input type="search" value={shapeSearch} aria-label="Search shapes" placeholder="Search shapes"
-                      onChange={e => setShapeSearch(e.target.value)} />
-                  </label>
-                  <nav className="shape-library-categories" aria-label="Shape categories">
-                    {SHAPE_CATEGORIES.map(category => (
-                      <button key={category} type="button" className={`shape-category-button${!shapeSearchNeedle && shapeCategory === category ? ' active' : ''}`}
-                        aria-pressed={!shapeSearchNeedle && shapeCategory === category}
-                        onClick={() => { setShapeCategory(category); setShapeSearch(''); engRef.current?.setDiagramContext(umlFamilyForCategory(category)); }} title={category}>
-                        {category}
-                      </button>
-                    ))}
-                  </nav>
-                  <div className="tool-popover-heading shape-library-heading" aria-live="polite">
-                    {shapeSearchNeedle ? `Search results (${visibleShapeTools.length})` : `${shapeCategory} (${visibleShapeTools.length})`}
-                  </div>
-                  {visibleShapeTools.length ? (
-                    <div className="shape-option-grid">
-                      {visibleShapeTools.map(({ id, label, definition }) => (
-                        <PopoverItem key={id} active={SHAPE_TOOLS.some(s => s.id === tool) ? tool === id : lastShapeTool === id}
-                          preview={<ShapePreview definition={definition} size={24} />} label={label}
-                          shapeId={definition.id} grid={true} solid3d={Boolean(definition.solid3d)}
-                          onClick={() => choosePopoverTool(id, shapeSearchNeedle ? definition.category : shapeCategory)} />
+                {/* TEXT GROUP */}
+                <div ref={el => { popoverAnchorRefs.current.text = el }} className="tool-group">
+                  <SideBtn label="Text, Math &amp; Code" shortcut="T" active={['text', 'math', 'code'].includes(tool)} expanded={openGroup === 'text'} hasSubmenu
+                    onClick={() => { const next = openGroup === 'text' ? null : 'text'; setOpenGroup(next); if (next) setTool(lastTextTool, true); }}>
+                    {(() => {
+                      const active = ['text', 'math', 'code'].includes(tool) ? tool : lastTextTool;
+                      if (active === 'math') return <Calculator size={23} strokeWidth={2} />;
+                      if (active === 'code') return <Code size={23} strokeWidth={2} />;
+                      return <Type size={23} strokeWidth={2.2} />;
+                    })()}
+                  </SideBtn>
+                  {openGroup === 'text' && (
+                    <div ref={popoverPanelRef} className="tool-popover tool-popover-list" role="group" aria-label="Text tools" onKeyDown={handlePopoverNavigation}
+                      style={{ left: popoverPosition?.left ?? -9999, top: popoverPosition?.top ?? -9999 }}>
+                      <div className="tool-popover-heading">Text &amp; math</div>
+                      {TEXT_TOOLS.map(t => (
+                        <PopoverItem key={t.id} active={['text', 'math', 'code'].includes(tool) ? tool === t.id : lastTextTool === t.id} Icon={t.Icon} label={t.label} onClick={() => { choosePopoverTool(t.id); }} />
                       ))}
                     </div>
-                  ) : <div className="shape-library-empty">No matching shapes.</div>}
+                  )}
                 </div>
-              )}
-            </div>
 
-            <div className="tool-divider" aria-hidden="true" />
-            <SideBtn label="Upload Image" shortcut="I" onClick={onImageToolClick}>
-              <ImageIcon size={23} strokeWidth={2} />
-            </SideBtn>
+                {/* SHAPES GROUP */}
+                <div ref={el => { popoverAnchorRefs.current.shapes = el }} className="tool-group">
+                  <SideBtn label="Shapes &amp; UML" shortcut="O" active={SHAPE_TOOLS.some(s => s.id === tool)} expanded={openGroup === 'shapes'} hasSubmenu
+                    onClick={() => { const next = openGroup === 'shapes' ? null : 'shapes'; setOpenGroup(next); if (next) setTool(lastShapeTool, true); }}>
+                    {(() => {
+                      const active = SHAPE_TOOLS.some(s => s.id === tool) ? tool : lastShapeTool;
+                      const entry = SHAPE_TOOLS.find(s => s.id === active) ?? SHAPE_TOOLS[0];
+                      return <ShapePreview definition={entry.definition} size={25} />;
+                    })()}
+                  </SideBtn>
+                  {openGroup === 'shapes' && (
+                    <div ref={popoverPanelRef} className="tool-popover tool-popover-shapes" role="group" aria-label="Shape tools"
+                      onKeyDown={e => {
+                        if (e.target instanceof HTMLInputElement && ['ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight'].includes(e.key)) return;
+                        handlePopoverNavigation(e);
+                      }}
+                      style={{ left: popoverPosition?.left ?? -9999, top: popoverPosition?.top ?? -9999 }}>
+                      <label className="shape-library-search">
+                        <Search size={14} aria-hidden="true" />
+                        <input type="search" value={shapeSearch} aria-label="Search shapes" placeholder="Search shapes"
+                          onChange={e => setShapeSearch(e.target.value)} />
+                      </label>
+                      <nav className="shape-library-categories" aria-label="Shape categories">
+                        {SHAPE_CATEGORIES.map(category => (
+                          <button key={category} type="button" className={`shape-category-button${!shapeSearchNeedle && shapeCategory === category ? ' active' : ''}`}
+                            aria-pressed={!shapeSearchNeedle && shapeCategory === category}
+                            onClick={() => { setShapeCategory(category); setShapeSearch(''); engRef.current?.setDiagramContext(umlFamilyForCategory(category)); }} title={category}>
+                            {category}
+                          </button>
+                        ))}
+                      </nav>
+                      <div className="tool-popover-heading shape-library-heading" aria-live="polite">
+                        {shapeSearchNeedle ? `Search results (${visibleShapeTools.length})` : `${shapeCategory} (${visibleShapeTools.length})`}
+                      </div>
+                      {visibleShapeTools.length ? (
+                        <div className="shape-option-grid">
+                          {visibleShapeTools.map(({ id, label, definition }) => (
+                            <PopoverItem key={id} active={SHAPE_TOOLS.some(s => s.id === tool) ? tool === id : lastShapeTool === id}
+                              preview={<ShapePreview definition={definition} size={24} />} label={label}
+                              shapeId={definition.id} grid={true} solid3d={Boolean(definition.solid3d)}
+                              onClick={() => choosePopoverTool(id, shapeSearchNeedle ? definition.category : shapeCategory)} />
+                          ))}
+                        </div>
+                      ) : <div className="shape-library-empty">No matching shapes.</div>}
+                    </div>
+                  )}
+                </div>
+
+                <div className="tool-divider" aria-hidden="true" />
+                <SideBtn label="Upload Image" shortcut="I" onClick={onImageToolClick}>
+                  <ImageIcon size={23} strokeWidth={2} />
+                </SideBtn>
+              </>
+            )}
           </div>
-          <div className="tool-stack tool-stack-bottom">
-            <div className="tool-divider" aria-hidden="true" />
-            <SideBtn label="Colors &amp; Styles" active={panelOpen} expanded={panelOpen} buttonRef={panelTriggerRef} onClick={() => setPanelOpen(v => !v)}>
-              <div className="sidebar-palette-swatch" style={{ borderColor: panelOpen ? '#4262FF' : 'rgba(0, 0, 0, 0.14)' }}>
-                <div className="sidebar-palette-fill" style={{ background: penColor }} />
-              </div>
-            </SideBtn>
-            <SideBtn label="Undo" shortcut="Ctrl+Z" onClick={() => engRef.current?.undo()}>
-              <Undo2 size={21} strokeWidth={2} />
-            </SideBtn>
-            <SideBtn label="Redo" shortcut="Ctrl+Y" onClick={() => engRef.current?.redo()}>
-              <Redo2 size={21} strokeWidth={2} />
-            </SideBtn>
-          </div>
+          {!isReadOnly && (
+            <div className="tool-stack tool-stack-bottom">
+              <div className="tool-divider" aria-hidden="true" />
+              <SideBtn label="Colors &amp; Styles" active={panelOpen} expanded={panelOpen} buttonRef={panelTriggerRef} onClick={() => setPanelOpen(v => !v)}>
+                <div className="sidebar-palette-swatch" style={{ borderColor: panelOpen ? '#4262FF' : 'rgba(0, 0, 0, 0.14)' }}>
+                  <div className="sidebar-palette-fill" style={{ background: penColor }} />
+                </div>
+              </SideBtn>
+              <SideBtn label="Undo" shortcut="Ctrl+Z" onClick={() => engRef.current?.undo()}>
+                <Undo2 size={21} strokeWidth={2} />
+              </SideBtn>
+              <SideBtn label="Redo" shortcut="Ctrl+Y" onClick={() => engRef.current?.redo()}>
+                <Redo2 size={21} strokeWidth={2} />
+              </SideBtn>
+            </div>
+          )}
         </aside>
 
         {/* CANVAS AREA */}
@@ -2303,6 +2767,11 @@ export default function App() {
             }
             if (followingPeerIdRef.current) setFollowingPeerId(null);
             eng.pointerDown(e.nativeEvent);
+            if (eng.isDrawingActive()) {
+              const world = eng.clientToWorld(e.clientX, e.clientY);
+              lastMouseWorldPosRef.current = world;
+              broadcastCollabCursor(world, true);
+            }
           }}
           onDoubleClick={e => engRef.current?.doubleClick(e.nativeEvent)}
           onContextMenu={e => {
@@ -2605,6 +3074,8 @@ export default function App() {
                 key={editShape.id}
                 initialText={editText}
                 initialPreviewText={editShape.previewText ?? editText}
+                initialWidth={editShape.w}
+                initialHeight={editShape.h}
                 fontSize={formulaFontSize}
                 zoom={cam.zoom}
                 worldX={editShape.x}
@@ -2624,7 +3095,7 @@ export default function App() {
           {/* Math Tools Panel handled inside FormulaEditor */}
 
           {/* Floating selection toolbar */}
-          {selIds.length > 0 && !editShape && (tool === 'select' || tool === 'lasso-select') && (
+          {selIds.length > 0 && !editShape && !isReadOnly && (tool === 'select' || tool === 'lasso-select') && (
             <div className="selection-toolbar toolbar no-canvas absolute top-4 left-1/2 -translate-x-1/2 z-40 flex items-center gap-1
                             bg-white rounded-xl shadow-md px-3 py-1.5 border border-gray-200">
               <span className="text-[11px] text-gray-600 font-medium pr-2 border-r border-gray-200">{selIds.length} selected</span>
@@ -3324,20 +3795,25 @@ export default function App() {
               ))}
             </div>
 
-            <div className="canvas-hud-hint" aria-label="Canvas controls: right-drag to pan; scroll to zoom at the pointer; double-click a text-like object to edit">
-              <span>Right-drag to pan</span><span className="hud-hint-divider" aria-hidden="true" />
-              <span>Scroll to zoom at pointer</span><span className="hud-hint-divider" aria-hidden="true" />
-              <span>Double-click text-like object to edit</span>
-              {boardRuntimeStatus.unsyncedRemoteChanges && (
-                <>
-                  <span className="hud-hint-divider" aria-hidden="true" />
-                  <span className="hud-syncing-pill">
-                    <span className="hud-syncing-dot" aria-hidden="true" />
-                    Syncing changes…
-                  </span>
-                </>
-              )}
-            </div>
+            {boardRuntimeStatus.unsyncedRemoteChanges && (
+              <div
+                className="hud-syncing-pill"
+                style={{
+                  gridArea: 'hint',
+                  justifySelf: 'center',
+                  background: 'rgba(255, 255, 255, 0.95)',
+                  padding: '6px 12px',
+                  borderRadius: '9999px',
+                  border: '1px solid rgba(203, 213, 225, 0.78)',
+                  boxShadow: '0 2px 8px rgba(15, 23, 42, 0.05)',
+                  fontSize: '11px',
+                  pointerEvents: 'auto',
+                }}
+              >
+                <span className="hud-syncing-dot" aria-hidden="true" />
+                Syncing changes…
+              </div>
+            )}
 
             <div className="hud-zoom-group">
               {/* Live Floating Reaction Picker */}

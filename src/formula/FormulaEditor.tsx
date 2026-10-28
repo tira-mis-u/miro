@@ -24,14 +24,16 @@ function safeParseFormula(source: string): FormulaNode {
 interface FormulaEditorProps {
   initialText: string;
   initialPreviewText?: string;
+  initialWidth?: number;
+  initialHeight?: number;
   fontSize: number;
   zoom: number;
   worldX: number;
   worldY: number;
   cam: { x: number; y: number };
   view: { w: number; h: number };
-  onTextChange: (text: string, lastValidPreview?: string) => void;
-  onCommit: (source?: string, lastValidPreview?: string) => void;
+  onTextChange: (text: string, lastValidPreview?: string, measuredSize?: { width: number; height: number }) => void;
+  onCommit: (source?: string, lastValidPreview?: string, measuredSize?: { width: number; height: number }) => void;
   onASTChange?: (ast: FormulaNode) => void;
   onResize?: (w: number, h: number) => void;
   onMove?: (x: number, y: number) => void;
@@ -50,6 +52,8 @@ const EDITOR_BORDER_ALLOWANCE = 2;
 export default function FormulaEditor({
   initialText,
   initialPreviewText,
+  initialWidth,
+  initialHeight,
   fontSize,
   zoom,
   worldX,
@@ -71,21 +75,23 @@ export default function FormulaEditor({
     initialProjection.previewText ? safeParseFormula(initialProjection.previewText) : createRow([createPlaceholder()])
   ));
   const lastValidTextRef = useRef(initialProjection.ast ? initialText : initialProjection.previewText);
+  const lastValidSizeRef = useRef<{ width: number; height: number }>({
+    width: Math.max(48, Number(initialWidth) || 48),
+    height: Math.max(36, Number(initialHeight) || 36),
+  });
   const [sourceError, setSourceError] = useState(initialProjection.sourceError);
   const refreshInitialPreviewRef = useRef(initialProjection.refreshStoredPreview);
   const [mode, setMode] = useState<FormulaEditorMode>('rendered');
-  const [sourceContentHeight, setSourceContentHeight] = useState(60);
   const [toolsMaxHeight, setToolsMaxHeight] = useState<number | undefined>(undefined);
   const [workspaceSize, setWorkspaceSize] = useState({ w: view.w, h: view.h });
 
-  const safeZoom = Math.max(0.01, zoom);
   const availableView = {
     w: workspaceSize.w > 0 ? workspaceSize.w : view.w,
     h: workspaceSize.h > 0 ? workspaceSize.h : view.h,
   };
   const screenX = (worldX - cam.x) * zoom + availableView.w / 2;
   const screenY = (worldY - cam.y) * zoom + availableView.h / 2;
-  const editorWidth = Math.max(1, Math.min(520, Math.max(1, availableView.w - 24) / safeZoom));
+  const editorWidth = Math.max(320, Math.min(520, availableView.w - 24));
   const toolsWidth = Math.max(1, Math.min(360, availableView.w - 16));
 
   const [panelPosition, setPanelPosition] = useState(() => {
@@ -93,7 +99,7 @@ export default function FormulaEditor({
     const clamp = (value: number, max: number) => Math.min(Math.max(value, margin), Math.max(margin, max - margin));
     const initW = view.w > 0 ? view.w : 1200;
     const initH = view.h > 0 ? view.h : 800;
-    const edW = Math.max(1, Math.min(520, Math.max(1, initW - 24) / safeZoom));
+    const edW = Math.max(320, Math.min(520, initW - 24));
     const scX = (worldX - cam.x) * zoom + initW / 2;
     const scY = (worldY - cam.y) * zoom + initH / 2;
     return {
@@ -105,7 +111,7 @@ export default function FormulaEditor({
   const [toolsPos, setToolsPos] = useState<{ x: number; y: number }>(() => {
     const initW = view.w > 0 ? view.w : 1200;
     const initH = view.h > 0 ? view.h : 800;
-    const edW = Math.max(1, Math.min(520, Math.max(1, initW - 24) / safeZoom));
+    const edW = Math.max(320, Math.min(520, initW - 24));
     const tW = Math.max(1, Math.min(360, initW - 16));
     const scX = (worldX - cam.x) * zoom + initW / 2;
     const scY = (worldY - cam.y) * zoom + initH / 2;
@@ -152,7 +158,7 @@ export default function FormulaEditor({
     onASTChangeRef.current = onASTChange;
   }, [onTextChange, onCommit, onResize, onASTChange]);
 
-  const maxPanelHeight = Math.max(1, (availableView.h - 16) / safeZoom);
+  const maxPanelHeight = Math.max(120, availableView.h - 16);
   const sourceChromeHeight = EDITOR_TOOLBAR_HEIGHT + SOURCE_NOTE_HEIGHT +
     (sourceError ? SOURCE_ERROR_HEIGHT : 0) + EDITOR_BORDER_ALLOWANCE;
   const maxSourceHeight = Math.max(1, maxPanelHeight - sourceChromeHeight);
@@ -161,10 +167,10 @@ export default function FormulaEditor({
   const initialSourceCursor = useMemo(() => {
     const parsed = parseSourceText(initialText);
     if (clickX === undefined || clickY === undefined) return parsed.normalized.length;
-    const charWidth = Math.max(4, 8 * zoom);
-    const lineHeight = Math.max(12, 25.6 * zoom);
-    const leftPadding = (screenX + 56 * zoom);
-    const topPadding = (screenY + (EDITOR_TOOLBAR_HEIGHT + SOURCE_NOTE_HEIGHT + 8) * zoom);
+    const charWidth = 8;
+    const lineHeight = 25.6;
+    const leftPadding = (screenX + 56);
+    const topPadding = (screenY + EDITOR_TOOLBAR_HEIGHT + SOURCE_NOTE_HEIGHT + 8);
     const dx = Math.max(0, clickX - leftPadding);
     const dy = Math.max(0, clickY - topPadding);
     const lines = parsed.normalized.split('\n');
@@ -173,7 +179,7 @@ export default function FormulaEditor({
     for (let index = 0; index < row; index++) offset += lines[index].length + 1;
     const column = Math.min(lines[row]?.length ?? 0, Math.round(dx / charWidth));
     return Math.min(parsed.normalized.length, offset + column);
-  }, [initialText, clickX, clickY, screenX, screenY, zoom]);
+  }, [initialText, clickX, clickY, screenX, screenY]);
 
   const onDragDown = (event: React.MouseEvent<HTMLDivElement>) => {
     event.preventDefault();
@@ -220,6 +226,19 @@ export default function FormulaEditor({
     return () => observer.disconnect();
   }, [view.w, view.h]);
 
+  const measureRenderedEquation = useCallback(() => {
+    const el = mathMeasureRef.current;
+    if (!el || !el.isConnected) return null;
+    const measured = el.getBoundingClientRect();
+    if (measured.width <= 0 || measured.height <= 0 || !Number.isFinite(measured.width) || !Number.isFinite(measured.height)) {
+      return null;
+    }
+    return {
+      width: Math.max(48, Math.ceil(measured.width) + 32),
+      height: Math.max(36, Math.ceil(measured.height) + 32),
+    };
+  }, []);
+
   const updateAST = useCallback((source: string) => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
     const revision = previewGateRef.current.begin();
@@ -231,14 +250,16 @@ export default function FormulaEditor({
         setAst(candidate);
         setSourceError(false);
         lastValidTextRef.current = source;
-        onTextChangeRef.current(source, source);
+        const measured = measureRenderedEquation();
+        if (measured) lastValidSizeRef.current = measured;
+        onTextChangeRef.current(source, source, lastValidSizeRef.current);
         onASTChangeRef.current?.(candidate);
       } else {
         setSourceError(true);
-        onTextChangeRef.current(source, lastValidTextRef.current);
+        onTextChangeRef.current(source, lastValidTextRef.current, lastValidSizeRef.current);
       }
     }, 30);
-  }, [fontSize]);
+  }, [fontSize, measureRenderedEquation]);
 
   useEffect(() => () => {
     if (debounceRef.current) clearTimeout(debounceRef.current);
@@ -248,14 +269,14 @@ export default function FormulaEditor({
   useEffect(() => {
     if (!refreshInitialPreviewRef.current) return;
     refreshInitialPreviewRef.current = false;
-    onTextChangeRef.current(initialText, initialText);
+    onTextChangeRef.current(initialText, initialText, lastValidSizeRef.current);
   }, [initialText]);
 
   const handleSourceChange = useCallback((source: string) => {
     inputTextRef.current = source;
     setInputText(source);
     // The authoritative source is written immediately; only the derived KaTeX validation is coalesced.
-    onTextChangeRef.current(source, lastValidTextRef.current);
+    onTextChangeRef.current(source, lastValidTextRef.current, lastValidSizeRef.current);
     updateAST(source);
   }, [updateAST]);
 
@@ -283,21 +304,15 @@ export default function FormulaEditor({
       setSourceError(false);
       lastValidTextRef.current = source;
       preview = source;
+      const measured = measureRenderedEquation();
+      if (measured) lastValidSizeRef.current = measured;
       onASTChangeRef.current?.(candidate);
     } else {
       setSourceError(true);
     }
-    onTextChangeRef.current(source, preview);
+    onTextChangeRef.current(source, preview, lastValidSizeRef.current);
     setMode('rendered');
-  }, [fontSize]);
-
-  const measureRenderedEquation = useCallback(() => {
-    const measured = mathMeasureRef.current?.getBoundingClientRect();
-    return {
-      width: Math.max(48, (measured?.width ?? 0) + 32),
-      height: Math.max(36, (measured?.height ?? 0) + 32),
-    };
-  }, []);
+  }, [fontSize, measureRenderedEquation]);
 
   const commitDraft = useCallback(() => {
     if (commitStartedRef.current || pendingCommitRef.current) return;
@@ -307,18 +322,31 @@ export default function FormulaEditor({
     const source = sourceEditorRef.current?.getText() ?? inputTextRef.current;
     const candidate = parseRenderableFormula(source, fontSize);
     let preview = lastValidTextRef.current;
+    let measuredSize = lastValidSizeRef.current;
     if (candidate) {
       setAst(candidate);
       setSourceError(false);
       lastValidTextRef.current = source;
       preview = source;
+      const measured = measureRenderedEquation();
+      if (!measured) {
+        setSourceError(true);
+        commitStartedRef.current = false;
+        return;
+      }
+      measuredSize = measured;
+      lastValidSizeRef.current = measured;
       onASTChangeRef.current?.(candidate);
     } else {
       setSourceError(true);
+      if (source.trim().length > 0 && !preview) {
+        commitStartedRef.current = false;
+        return;
+      }
     }
     inputTextRef.current = source;
     setInputText(source);
-    onTextChangeRef.current(source, preview);
+    onTextChangeRef.current(source, preview, measuredSize);
 
     if (mode === 'source') {
       pendingCommitRef.current = { source, preview };
@@ -326,9 +354,8 @@ export default function FormulaEditor({
       return;
     }
 
-    const measured = measureRenderedEquation();
-    onResizeRef.current?.(measured.width, measured.height);
-    onCommitRef.current(source, preview);
+    onResizeRef.current?.(measuredSize.width, measuredSize.height);
+    onCommitRef.current(source, preview, measuredSize);
   }, [fontSize, measureRenderedEquation, mode]);
 
   useLayoutEffect(() => {
@@ -339,20 +366,16 @@ export default function FormulaEditor({
   }, [mode]);
 
   useLayoutEffect(() => {
-    if (mode !== 'source') return;
-    const chrome = EDITOR_TOOLBAR_HEIGHT + SOURCE_NOTE_HEIGHT +
-      (sourceError ? SOURCE_ERROR_HEIGHT : 0) + EDITOR_BORDER_ALLOWANCE;
-    onResizeRef.current?.(editorWidth, chrome + sourceContentHeight);
-  }, [mode, sourceContentHeight, sourceError, editorWidth]);
-
-  useLayoutEffect(() => {
     if (mode !== 'rendered') return;
     const measured = measureRenderedEquation();
-    onResizeRef.current?.(measured.width, measured.height);
+    if (measured) {
+      lastValidSizeRef.current = measured;
+      onResizeRef.current?.(measured.width, measured.height);
+    }
     if (pendingCommitRef.current) {
       const pending = pendingCommitRef.current;
       pendingCommitRef.current = null;
-      onCommitRef.current(pending.source, pending.preview);
+      onCommitRef.current(pending.source, pending.preview, lastValidSizeRef.current);
     }
   }, [mode, previewHTML, measureRenderedEquation]);
 
@@ -464,19 +487,18 @@ export default function FormulaEditor({
     const workspace = editor?.parentElement;
     if (!editor || !workspace) return;
     const workspaceRect = workspace.getBoundingClientRect();
-    const editorRect = editor.getBoundingClientRect();
     const margin = 8;
     const clamp = (value: number, max: number) => Math.min(Math.max(value, margin), Math.max(margin, max - margin));
 
-    // The Formula Editor is the primary focus; it can move freely across the entire workspace height & width
-    const editorX = clamp(screenX, workspaceRect.width - editorRect.width);
-    const editorY = clamp(screenY, workspaceRect.height - editorRect.height);
+    // Anchor top-left without jumping when panel height changes:
+    const editorX = clamp(screenX, Math.max(margin, workspaceRect.width - editorWidth));
+    const editorY = clamp(screenY, Math.max(margin, workspaceRect.height - 120));
 
     setPanelPosition(current => {
       if (Math.abs(current.editorX - editorX) < 0.5 && Math.abs(current.editorY - editorY) < 0.5) return current;
       return { editorX, editorY };
     });
-  }, [screenX, screenY]);
+  }, [screenX, screenY, editorWidth]);
 
   // Initialize Math Tools position safely when first shown
   useLayoutEffect(() => {
@@ -485,17 +507,9 @@ export default function FormulaEditor({
     }
   }, [showTools, toolsPos, openToolsSafe]);
 
+  // Recalculate anchor when camera changes or shape moves, decoupled from editor's internal content resizing.
   useLayoutEffect(() => {
-    const frame = window.requestAnimationFrame(repositionPanels);
-    return () => window.cancelAnimationFrame(frame);
-  }, [repositionPanels, editorWidth, maxPanelHeight, mode, sourceContentHeight, sourceError]);
-
-  useLayoutEffect(() => {
-    const editor = editorPanelRef.current;
-    if (!editor || typeof ResizeObserver === 'undefined') return;
-    const observer = new ResizeObserver(() => repositionPanels());
-    observer.observe(editor);
-    return () => observer.disconnect();
+    repositionPanels();
   }, [repositionPanels]);
 
   const commitRef = useRef(commitDraft);
@@ -527,8 +541,7 @@ export default function FormulaEditor({
           width: editorWidth,
           maxWidth: editorWidth,
           maxHeight: maxPanelHeight,
-          transform: `scale(${zoom})`,
-          transformOrigin: 'top left',
+          transform: 'none',
           zIndex: 1001,
         }}
         onPointerDown={event => event.stopPropagation()}
@@ -599,7 +612,7 @@ export default function FormulaEditor({
             maxHeight={maxSourceHeight}
             active={mode === 'source'}
             onChange={handleSourceChange}
-            onLayout={height => setSourceContentHeight(current => current === height ? current : height)}
+            onLayout={() => {}}
             onCommit={commitDraft}
           />
           {mode === 'rendered' && sourceError && (

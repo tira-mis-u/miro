@@ -1,13 +1,62 @@
+import os from 'node:os';
 import { Hocuspocus } from '@hocuspocus/server';
 import { WebSocketServer } from 'ws';
 import type { Plugin } from 'vite';
 import { createRealtimeRuntime } from './realtimeRuntime.js';
+import { getLinkPreviewMetadata } from './linkPreviewService';
+import { handleMediaUpload } from './mediaUploadService';
 
 /** Mount Hocuspocus upgrades on Vite's existing HTTP listener at /ws. */
 export function hocuspocusPlugin(): Plugin {
   return {
     name: 'antiwhite-hocuspocus',
     configureServer(viteServer) {
+      viteServer.middlewares.use('/api/link-preview', async (req, res) => {
+        try {
+          const requestUrl = new URL(req.url ?? '/', 'http://vite.local');
+          const targetUrl = requestUrl.searchParams.get('url');
+          if (!targetUrl) {
+            res.statusCode = 400;
+            res.setHeader('Content-Type', 'application/json');
+            res.end(JSON.stringify({ error: 'Missing url query parameter' }));
+            return;
+          }
+          const metadata = await getLinkPreviewMetadata(targetUrl);
+          res.statusCode = 200;
+          res.setHeader('Content-Type', 'application/json');
+          res.setHeader('Cache-Control', 'public, max-age=3600');
+          res.end(JSON.stringify(metadata));
+        } catch (err) {
+          const isForbidden = err instanceof Error && (err.message.includes('forbidden') || err.message.includes('private IP'));
+          res.statusCode = isForbidden ? 403 : 500;
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ error: err instanceof Error ? err.message : 'Failed to fetch preview' }));
+        }
+      });
+
+      viteServer.middlewares.use('/api/media/upload', (req, res) => {
+        void handleMediaUpload(req, res);
+      });
+
+      viteServer.middlewares.use('/api/network-info', (_req, res) => {
+        try {
+          const interfaces = os.networkInterfaces();
+          const ips: string[] = [];
+          for (const devName of Object.keys(interfaces)) {
+            for (const iface of interfaces[devName] || []) {
+              if (iface.family === 'IPv4' && !iface.internal) {
+                ips.push(iface.address);
+              }
+            }
+          }
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ ips, port: viteServer.config.server.port ?? 5175 }));
+        } catch {
+          res.setHeader('Content-Type', 'application/json');
+          res.end(JSON.stringify({ ips: [], port: 5175 }));
+        }
+      });
+
       const httpServer = viteServer.httpServer;
       // Middleware-only Vite instances (for tests/tools) have no HTTP listener to attach to.
       if (!httpServer) return;

@@ -1,6 +1,5 @@
 // KaTeX-backed renderer shared by palette previews, the formula editor, and static canvas objects.
 import katex from 'katex';
-import 'katex/dist/katex.min.css';
 import type { FormulaNode } from './types';
 import { serializeToLatex } from './ast';
 

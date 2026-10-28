@@ -2,7 +2,7 @@ import type { ToolType } from './CanvasEngine';
 
 export type CanvasShortcutAction =
   | { type: 'pan'; dx: number; dy: number }
-  | { type: 'undo' | 'redo' | 'select-all' | 'duplicate' | 'delete' | 'clear-selection' | 'open-image' }
+  | { type: 'undo' | 'redo' | 'select-all' | 'duplicate' | 'copy' | 'delete' | 'clear-selection' | 'open-image' }
   | { type: 'tool'; tool: ToolType };
 
 interface ShortcutKeyInput {
@@ -33,6 +33,7 @@ export function getCanvasShortcutAction(
   if (ctrl && event.key.toLowerCase() === 'z') return event.shiftKey ? { type: 'redo' } : { type: 'undo' };
   if (ctrl && event.key.toLowerCase() === 'y') return { type: 'redo' };
   if (ctrl && event.key === 'd') return { type: 'duplicate' };
+  if (ctrl && event.key.toLowerCase() === 'c') return { type: 'copy' };
   if (event.key === 'Delete' || event.key === 'Backspace') return { type: 'delete' };
 
   const toolByKey: Record<string, ToolType | 'img'> = {

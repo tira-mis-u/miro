@@ -108,7 +108,7 @@ export function preprocessSmartStroke(input: number[][], options: PreprocessOpti
   const raw: Point2[] = finite.map(point => [point[0], point[1]]);
   const sourceBounds = boundsOf(raw);
   const scale = Math.hypot(sourceBounds.w, sourceBounds.h);
-  if (!Number.isFinite(scale) || scale <= 1e-9) return null;
+  if (!Number.isFinite(scale) || scale < 10) return null;
   const centerX = sourceBounds.x + sourceBounds.w / 2;
   const centerY = sourceBounds.y + sourceBounds.h / 2;
   const normalizedSource = raw.map(point => [(point[0] - centerX) / scale, (point[1] - centerY) / scale] as Point2);
@@ -120,13 +120,42 @@ export function preprocessSmartStroke(input: number[][], options: PreprocessOpti
   if (deduplicated.length < 2) return null;
 
   const traceLength = pathLength(deduplicated);
-  const endpointGap = distance(deduplicated[0], deduplicated[deduplicated.length - 1]);
-  const closedCandidate = endpointGap <= (options.closureTolerance ?? 0.18) && traceLength + endpointGap >= 1.5;
+  let endpointGap = distance(deduplicated[0], deduplicated[deduplicated.length - 1]);
+  let closedCandidate = endpointGap <= (options.closureTolerance ?? 0.38) && traceLength + endpointGap >= 1.2;
+
+  // Detect and extract closed loop if the stroke has an overshoot tail ("thừa nét") or lead-in
+  let loopPoints = deduplicated;
+  if (!closedCandidate && deduplicated.length >= 10 && traceLength >= 1.5) {
+    const N = deduplicated.length;
+    const maxI = Math.floor(N * 0.35);
+    const minJ = Math.floor(N * 0.55);
+    let bestDist = Infinity;
+    let bestI = 0;
+    let bestJ = N - 1;
+    for (let i = 0; i <= maxI; i++) {
+      for (let j = minJ; j < N; j++) {
+        const d = distance(deduplicated[i], deduplicated[j]);
+        if (d < bestDist) {
+          bestDist = d;
+          bestI = i;
+          bestJ = j;
+        }
+      }
+    }
+    const loopCandidate = deduplicated.slice(bestI, bestJ + 1);
+    const loopLen = pathLength(loopCandidate);
+    if (bestDist <= 0.28 && loopLen >= 0.65 * traceLength) {
+      loopPoints = loopCandidate;
+      endpointGap = bestDist;
+      closedCandidate = true;
+    }
+  }
+
   const sampleCount = Math.max(24, Math.min(128, Math.round(options.sampleCount ?? RECOGNITION_SAMPLE_COUNT)));
-  const samples = smoothJitter(resampleByArcLength(deduplicated, sampleCount), false);
+  const samples = smoothJitter(resampleByArcLength(loopPoints, sampleCount), false);
   let closedSamples: Point2[] | null = null;
   if (closedCandidate) {
-    const ring = deduplicated.slice();
+    const ring = loopPoints.slice();
     if (distance(ring[0], ring[ring.length - 1]) > 1e-9) ring.push([...ring[0]]);
     closedSamples = smoothJitter(resampleByArcLength(ring, sampleCount), true);
   }

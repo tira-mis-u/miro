@@ -75,9 +75,10 @@ function createTriangleTemplates(): ShapeTemplate[] {
 
 function createEllipseTemplates(): ShapeTemplate[] {
   const templates: ShapeTemplate[] = [];
-  for (const aspect of [1, 1.12, 1.3, 1.55, 1.85, 2.25, 2.7, 3.1]) {
-    const rx = Math.sqrt(aspect * aspect / (aspect * aspect + 1));
-    const ry = rx / aspect;
+  for (const aspect of [0.35, 0.5, 0.72, 1, 1.4, 2, 2.8]) {
+    const width = Math.sqrt(aspect * aspect / (aspect * aspect + 1));
+    const height = width / aspect;
+    const rx = width / 2, ry = height / 2;
     const points = Array.from({ length: TEMPLATE_SAMPLE_COUNT + 1 }, (_, index) => {
       const angle = index / TEMPLATE_SAMPLE_COUNT * Math.PI * 2;
       return [rx * Math.cos(angle), ry * Math.sin(angle)] as Point2;
@@ -87,9 +88,115 @@ function createEllipseTemplates(): ShapeTemplate[] {
   return templates;
 }
 
+function createDiamondTemplates(): ShapeTemplate[] {
+  const templates: ShapeTemplate[] = [];
+  for (const aspect of [0.65, 0.85, 1, 1.25, 1.55]) {
+    const width = Math.sqrt(aspect * aspect / (aspect * aspect + 1));
+    const height = width / aspect;
+    const vertices: Point2[] = [
+      [0, -height / 2],
+      [width / 2, 0],
+      [0, height / 2],
+      [-width / 2, 0],
+    ];
+    templates.push(template('diamond', `diamond-${aspect}`, closedPath(vertices), aspect, 4));
+  }
+  return templates;
+}
+
+function createArrowTemplates(): ShapeTemplate[] {
+  const templates: ShapeTemplate[] = [];
+  for (const headAngle of [0.45, 0.6]) {
+    const points: Point2[] = [
+      [0, 0],
+      [0.8, 0],
+      [0.6, -headAngle * 0.3],
+      [0.8, 0],
+      [0.6, headAngle * 0.3],
+    ];
+    templates.push(template('arrow', `arrow-${headAngle}`, points, Infinity, 2, false));
+  }
+  return templates;
+}
+
+function createStarTemplates(): ShapeTemplate[] {
+  const templates: ShapeTemplate[] = [];
+  const points: Point2[] = [];
+  for (let i = 0; i <= 10; i++) {
+    const a = (i / 10) * Math.PI * 2 - Math.PI / 2;
+    const r = i % 2 === 0 ? 0.5 : 0.22;
+    points.push([r * Math.cos(a), r * Math.sin(a)]);
+  }
+  templates.push(template('star', 'star-5p', points, 1, 5, true));
+  return templates;
+}
+
+function createHeartTemplates(): ShapeTemplate[] {
+  const templates: ShapeTemplate[] = [];
+  for (const aspect of [0.85, 1.0, 1.15]) {
+    const points: Point2[] = [];
+    const count = 64;
+    for (let i = 0; i < count; i++) {
+      const t = (i / count) * Math.PI * 2;
+      const x = 16 * Math.pow(Math.sin(t), 3);
+      const y = -(13 * Math.cos(t) - 5 * Math.cos(2 * t) - 2 * Math.cos(3 * t) - Math.cos(4 * t));
+      points.push([x / 16 * aspect, y / 16]);
+    }
+    templates.push(template('heart', `heart-${aspect}`, closedPath(points), aspect, 2));
+  }
+  return templates;
+}
+
+function createParallelogramTemplates(): ShapeTemplate[] {
+  const templates: ShapeTemplate[] = [];
+  for (const aspect of [1.0, 1.35, 1.7]) {
+    const width = Math.sqrt(aspect * aspect / (aspect * aspect + 1));
+    const height = width / aspect;
+    for (const skewSign of [1, -1]) {
+      const skew = width * 0.24 * skewSign;
+      const vertices: Point2[] = [
+        [-width / 2 + skew, -height / 2],
+        [width / 2, -height / 2],
+        [width / 2 - skew, height / 2],
+        [-width / 2, height / 2],
+      ];
+      templates.push(template('parallelogram', `parallelogram-${aspect}-${skewSign}`, closedPath(vertices), aspect, 4));
+    }
+  }
+  return templates;
+}
+
+function createTrapezoidTemplates(): ShapeTemplate[] {
+  const templates: ShapeTemplate[] = [];
+  for (const aspect of [1.0, 1.35, 1.7]) {
+    const width = Math.sqrt(aspect * aspect / (aspect * aspect + 1));
+    const height = width / aspect;
+    for (const topRatio of [0.55, 0.72]) {
+      const topW = width * topRatio;
+      const vertices: Point2[] = [
+        [-topW / 2, -height / 2],
+        [topW / 2, -height / 2],
+        [width / 2, height / 2],
+        [-width / 2, height / 2],
+      ];
+      templates.push(template('trapezoid', `trapezoid-${aspect}-${topRatio}`, closedPath(vertices), aspect, 4));
+    }
+  }
+  return templates;
+}
+
 /** Small, bounded, deterministic template bank; no network or learned parameters. */
 export const SMART_DRAWING_TEMPLATES: readonly ShapeTemplate[] = Object.freeze([
-  ...createLineTemplates(), ...createRectangleTemplates(), ...createTriangleTemplates(), ...createEllipseTemplates(),
+  ...createLineTemplates(),
+  ...createArrowTemplates(),
+  ...createRectangleTemplates(),
+  ...createParallelogramTemplates(),
+  ...createTrapezoidTemplates(),
+  ...createTriangleTemplates(),
+  ...createEllipseTemplates(),
+  ...createDiamondTemplates(),
+  ...createStarTemplates(),
+  ...createHeartTemplates(),
 ]);
 
 function meanNearestDistance(a: Point2[], b: Point2[]): number {
